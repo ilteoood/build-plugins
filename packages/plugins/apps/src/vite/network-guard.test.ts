@@ -7,7 +7,10 @@
 import child_process from 'child_process';
 import dgram from 'dgram';
 import dns from 'dns';
+import fs from 'fs';
 import net from 'net';
+import os from 'os';
+import path from 'path';
 import { promisify } from 'util';
 import worker_threads from 'worker_threads';
 
@@ -1029,6 +1032,135 @@ describe('network-guard', () => {
             resolveAbandonedFn?.();
             await abandoned;
         });
+
+        // Only the write side is guarded (see network-guard.ts's comment above the fs write-guard
+        // installs for why reads stay open, and for the graceful-fs collision that keeps
+        // writeFile/appendFile/copyFile's callback form and chown/chmod out of this list entirely).
+        describe('fs write guard', () => {
+            let tmpDir: string;
+            let testFile: string;
+
+            beforeEach(() => {
+                tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dd-fs-guard-'));
+                testFile = path.join(tmpDir, 'test.txt');
+            });
+
+            afterEach(() => {
+                fs.rmSync(tmpDir, { recursive: true, force: true });
+            });
+
+            test('Should block fs.writeFileSync made inside fn', async () => {
+                await expect(
+                    runBlocked(async () => {
+                        fs.writeFileSync(testFile, 'data');
+                    }),
+                ).rejects.toThrow(/Writing to the filesystem is not allowed/);
+                expect(fs.existsSync(testFile)).toBe(false);
+            });
+
+            // unlink reports failure via its mandatory error-first callback, never a synchronous throw.
+            test('Should block fs.unlink made inside fn via its error-first callback, not a synchronous throw', async () => {
+                fs.writeFileSync(testFile, 'data');
+                await runBlocked(async () => {
+                    const err = await new Promise<Error>((resolve) => {
+                        expect(() =>
+                            fs.unlink(testFile, (unlinkErr) => resolve(unlinkErr as Error)),
+                        ).not.toThrow();
+                    });
+                    expect(err.message).toMatch(/Writing to the filesystem is not allowed/);
+                });
+                expect(fs.existsSync(testFile)).toBe(true);
+            });
+
+            test('Should reject rather than throw synchronously from fs.promises.writeFile when blocked', async () => {
+                await runBlocked(async () => {
+                    await expect(fs.promises.writeFile(testFile, 'data')).rejects.toThrow(
+                        /Writing to the filesystem is not allowed/,
+                    );
+                });
+                expect(fs.existsSync(testFile)).toBe(false);
+            });
+
+            test('Should allow fs.writeFileSync outside a blocked scope', () => {
+                expect(() => fs.writeFileSync(testFile, 'data')).not.toThrow();
+                expect(fs.readFileSync(testFile, 'utf8')).toBe('data');
+            });
+
+            test('Should still allow fs.readFileSync inside a blocked scope, since only writes are guarded', async () => {
+                fs.writeFileSync(testFile, 'data');
+                await runBlocked(async () => {
+                    expect(fs.readFileSync(testFile, 'utf8')).toBe('data');
+                });
+            });
+
+            // openSync itself stays allowed (documented residual gap), but write/writeSync on the
+            // resulting fd is the far more direct path to the same disk write writeFileSync blocks
+            // above — leaving it unguarded would make openSync+writeSync a trivial full bypass.
+            test('Should block fs.writeSync made inside fn on an fd from openSync', async () => {
+                const fd = fs.openSync(testFile, 'w');
+                try {
+                    await expect(
+                        runBlocked(async () => {
+                            fs.writeSync(fd, 'data');
+                        }),
+                    ).rejects.toThrow(/Writing to the filesystem is not allowed/);
+                } finally {
+                    fs.closeSync(fd);
+                }
+                expect(fs.readFileSync(testFile, 'utf8')).toBe('');
+            });
+
+            test('Should block fs.write made inside fn via its error-first callback, not a synchronous throw', async () => {
+                const fd = fs.openSync(testFile, 'w');
+                try {
+                    await runBlocked(async () => {
+                        const err = await new Promise<Error>((resolve) => {
+                            expect(() =>
+                                fs.write(fd, 'data', (writeErr) => resolve(writeErr as Error)),
+                            ).not.toThrow();
+                        });
+                        expect(err.message).toMatch(/Writing to the filesystem is not allowed/);
+                    });
+                } finally {
+                    fs.closeSync(fd);
+                }
+                expect(fs.readFileSync(testFile, 'utf8')).toBe('');
+            });
+
+            // mkdtemp creates a real directory, same class of write as mkdir — omitting it would let a
+            // blocked function still create directories under the OS temp path.
+            test('Should block fs.mkdtempSync made inside fn', async () => {
+                await expect(
+                    runBlocked(async () => {
+                        fs.mkdtempSync(path.join(tmpDir, 'nested-'));
+                    }),
+                ).rejects.toThrow(/Writing to the filesystem is not allowed/);
+                expect(fs.readdirSync(tmpDir)).toHaveLength(0);
+            });
+
+            test('Should block fs.mkdtemp made inside fn via its error-first callback, not a synchronous throw', async () => {
+                await runBlocked(async () => {
+                    const err = await new Promise<Error>((resolve) => {
+                        expect(() =>
+                            fs.mkdtemp(path.join(tmpDir, 'nested-'), (mkdtempErr) =>
+                                resolve(mkdtempErr as Error),
+                            ),
+                        ).not.toThrow();
+                    });
+                    expect(err.message).toMatch(/Writing to the filesystem is not allowed/);
+                });
+                expect(fs.readdirSync(tmpDir)).toHaveLength(0);
+            });
+
+            test('Should reject rather than throw synchronously from fs.promises.mkdtemp when blocked', async () => {
+                await runBlocked(async () => {
+                    await expect(fs.promises.mkdtemp(path.join(tmpDir, 'nested-'))).rejects.toThrow(
+                        /Writing to the filesystem is not allowed/,
+                    );
+                });
+                expect(fs.readdirSync(tmpDir)).toHaveLength(0);
+            });
+        });
     });
 });
 
@@ -1133,6 +1265,37 @@ describe('installGuardedProperty security', () => {
                 process.env.JEST_WORKER_ID = originalJestWorkerId;
             }
         }
+    });
+
+    // A hostile dependency could set globalThis.jest = {} to fake RUNNING_UNDER_JEST outside real
+    // Jest. jest.isolateModules can't exercise this — Jest's own module wrapper always injects a
+    // real `jest` closure that shadows globalThis.jest — so this spawns a genuine non-Jest process.
+    test("Should not treat a bare globalThis.jest override lacking Jest's real shape as running under Jest, in a real non-Jest process", () => {
+        const result = child_process
+            .execFileSync(
+                process.execPath,
+                [
+                    '-r',
+                    'ts-node/register',
+                    '-e',
+                    // console.log(String(...)), not the bare boolean — a bare boolean can come back
+                    // ANSI-colored by Node's own inspect() if the parent's env forces color, corrupting
+                    // the exact-match assertion below.
+                    "global.jest = {}; const ng = require(process.argv[1]); console.log(String(ng.shouldAllowConfigurableUnderJest(globalThis, 'fetch')));",
+                    require.resolve('./network-guard'),
+                ],
+                {
+                    encoding: 'utf8',
+                    env: {
+                        ...process.env,
+                        TS_NODE_TRANSPILE_ONLY: '1',
+                        TS_NODE_COMPILER_OPTIONS: '{"module":"commonjs","moduleResolution":"node"}',
+                    },
+                },
+            )
+            .trim();
+
+        expect(result).toBe('false');
     });
 
     // Guarding net.Socket.prototype directly (one property, shared by every socket) means a plain

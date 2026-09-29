@@ -7,6 +7,7 @@
 import child_process from 'child_process';
 import dgram from 'dgram';
 import dns from 'dns';
+import fs from 'fs';
 import net from 'net';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { EventEmitter } from 'node:events';
@@ -24,6 +25,7 @@ const NETWORK_BLOCKED_MESSAGE =
 const SUBPROCESS_BLOCKED_MESSAGE = 'Spawning a subprocess is not allowed in backend functions.';
 const WORKER_THREAD_BLOCKED_MESSAGE =
     'Spawning a worker thread is not allowed in backend functions.';
+const FS_WRITE_BLOCKED_MESSAGE = 'Writing to the filesystem is not allowed in backend functions.';
 
 interface GuardedAsyncContext {
     isActive(): boolean;
@@ -91,16 +93,29 @@ function isCurrentlyBlocked(): boolean {
 const ALREADY_GUARDED = Symbol.for('@dd/apps-plugin/network-guard installed');
 
 // Jest's globalThis Proxy can't produce a non-configurable property without throwing, and by then
-// it's already mutated the real object — so relax configurability under Jest (detected via this
-// env var) instead of hitting that failure. Production never sets it.
-const RUNNING_UNDER_JEST = process.env.JEST_WORKER_ID !== undefined;
+// it's already mutated the real object — so relax configurability under Jest instead of hitting
+// that failure. `jest` is a TS-only declaration; at runtime a bare reference falls through to
+// globalThis if unbound, so checking real Jest globals' shape (not just typeof jest) keeps a
+// stray `globalThis.jest = {}` from spoofing this outside Jest.
+declare const jest: unknown;
+declare const describe: unknown;
+declare const expect: unknown;
+const RUNNING_UNDER_JEST =
+    typeof jest === 'object' &&
+    jest !== null &&
+    typeof (jest as { fn?: unknown }).fn === 'function' &&
+    typeof describe === 'function' &&
+    typeof expect === 'function' &&
+    typeof (expect as { getState?: unknown }).getState === 'function';
 
 // Module objects (net/dgram/dns) stay non-configurable even under Jest, or dd-trace's CI
 // Visibility instrumentation could swap in its own unguarded function. globalThis is relaxed so
 // Jest's environment can still touch it. write/end need their own carve-out: CI pipes
 // stdout/stderr into real net.Socket instances, and jest-mock's spyOn/restoreMock needs
 // `configurable` to restore them.
-function shouldAllowConfigurableUnderJest(target: object, prop: string): boolean {
+// Exported for testability — installGuardedProperty's own side effects are process-wide and
+// permanent, so exercising RUNNING_UNDER_JEST needs a direct call instead.
+export function shouldAllowConfigurableUnderJest(target: object, prop: string): boolean {
     if (!RUNNING_UNDER_JEST) {
         return false;
     }
@@ -327,22 +342,28 @@ function guardBindMethod<F extends (this: EventEmitter, ...args: never[]) => unk
     return wrapper as unknown as F;
 }
 
-// dgram.Socket.send and the callback-style dns.resolve* surfaces report failure via an error-first
-// callback (dns.resolve*'s is mandatory, dgram's optional, falling back to an async 'error' event).
-// Deferred via process.nextTick for the same reason as guardBindMethod.
-function guardCallbackMethod<F extends (...args: never[]) => unknown>(getReal: () => F): F {
-    const wrapper = function (this: unknown, ...args: unknown[]): unknown {
-        if (!isCurrentlyBlocked()) {
-            return (getReal() as unknown as (...a: unknown[]) => unknown).apply(this, args);
-        }
-        const err = new Error(NETWORK_BLOCKED_MESSAGE);
-        if (!invokeCallbackArg(args, err) && this instanceof EventEmitter) {
-            emitAsyncErrorIfListened(this, err);
-        }
-        return undefined;
+// Shared by dgram.Socket.send, the callback-style dns.resolve* surfaces, and fs's callback-style
+// write methods — all report failure via an error-first callback (dns.resolve*'s and fs's are
+// mandatory, dgram's optional, falling back to an async 'error' event). Deferred via
+// process.nextTick for the same reason as guardBindMethod.
+function makeCallbackGuard(blockedMessage: string) {
+    return function guardCallbackMethod<F extends (...args: never[]) => unknown>(
+        getReal: () => F,
+    ): F {
+        const wrapper = function (this: unknown, ...args: unknown[]): unknown {
+            if (!isCurrentlyBlocked()) {
+                return (getReal() as unknown as (...a: unknown[]) => unknown).apply(this, args);
+            }
+            const err = new Error(blockedMessage);
+            if (!invokeCallbackArg(args, err) && this instanceof EventEmitter) {
+                emitAsyncErrorIfListened(this, err);
+            }
+            return undefined;
+        };
+        return wrapper as unknown as F;
     };
-    return wrapper as unknown as F;
 }
+const guardNetworkCallbackMethod = makeCallbackGuard(NETWORK_BLOCKED_MESSAGE);
 
 // dns.promises.*/dns.promises.Resolver.prototype.* always return a Promise, so a `.catch()`-chaining
 // caller needs a rejection, not a thrown exception.
@@ -577,7 +598,7 @@ installGuardedProperty<typeof fetch>(globalThis, 'fetch', guardNetworkPromiseMet
 installGuardedProperty<typeof dgram.Socket.prototype.send>(
     dgram.Socket.prototype,
     'send',
-    guardCallbackMethod,
+    guardNetworkCallbackMethod,
 );
 installGuardedProperty<typeof dgram.Socket.prototype.connect>(
     dgram.Socket.prototype,
@@ -623,11 +644,11 @@ const DNS_RESOLVE_METHODS = [
 for (const method of DNS_RESOLVE_METHODS) {
     // Each method's real signature differs, so the type argument is pinned to the guard's own
     // constraint instead (same approach as the child_process installs below).
-    installGuardedProperty<(...args: never[]) => unknown>(dns, method, guardCallbackMethod);
+    installGuardedProperty<(...args: never[]) => unknown>(dns, method, guardNetworkCallbackMethod);
     installGuardedProperty<(...args: never[]) => unknown>(
         dns.Resolver.prototype,
         method,
-        guardCallbackMethod,
+        guardNetworkCallbackMethod,
     );
     // dns.promises.*/dns.promises.Resolver.prototype.* always return a Promise, so these use the
     // reject-not-throw guard instead.
@@ -679,6 +700,68 @@ installGuardedProperty<(...args: never[]) => unknown>(
 );
 
 installGuardedProperty<unknown>(worker_threads, 'Worker', guardWorker);
+
+// Reads stay open — Vite's own SSR loading and a dependency reading a bundled data file both need
+// them, and this guard's job is dev-loop safety, not a hard security boundary (see the "No OS
+// sandbox" note above). Only the write side is guarded, matching production's Deno sandbox denying
+// fs outright. chown/chmod (+ Sync) are excluded entirely, and writeFile/appendFile/copyFile's
+// callback form is guarded only via its Sync/promise siblings below, not here — graceful-fs (a
+// common transitive dependency, e.g. via webpack/rspack's own tooling) unconditionally reassigns
+// exactly these methods at its own module-load time for portability shims, colliding with this
+// guard's non-configurable property hard enough to throw and crash the process outright,
+// regardless of whether that load happens under Jest. open/openSync's own writable fd, and a
+// FileHandle's own write()/writeFile() methods from fs.promises.open() (need a handle-construction
+// guard, not a call guard), plus createWriteStream/writev(Sync), are a further documented residual
+// gap, same framing as dns.lookup's exclusion above — write/writeSync below close the far more
+// direct openSync-then-write bypass of that same gap.
+const guardFsWriteCallbackMethod = makeCallbackGuard(FS_WRITE_BLOCKED_MESSAGE);
+const FS_SYNC_WRITE_METHODS = [
+    'writeFileSync',
+    'appendFileSync',
+    'copyFileSync',
+    'unlinkSync',
+    'rmSync',
+    'rmdirSync',
+    'renameSync',
+    'mkdirSync',
+    'symlinkSync',
+    'linkSync',
+    'cpSync',
+    'truncateSync',
+    'mkdtempSync',
+    'writeSync',
+] as const;
+const FS_CALLBACK_AND_PROMISE_WRITE_METHODS = [
+    'unlink',
+    'rm',
+    'rmdir',
+    'rename',
+    'mkdir',
+    'symlink',
+    'link',
+    'cp',
+    'truncate',
+    'mkdtemp',
+    'write',
+] as const;
+const FS_PROMISE_ONLY_WRITE_METHODS = ['writeFile', 'appendFile', 'copyFile'] as const;
+for (const method of FS_SYNC_WRITE_METHODS) {
+    installGuardedProperty<(...args: never[]) => unknown>(fs, method, (getReal) =>
+        makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'throw'),
+    );
+}
+for (const method of FS_CALLBACK_AND_PROMISE_WRITE_METHODS) {
+    installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsWriteCallbackMethod);
+    // fs.promises and require('fs/promises') are the same object — patching one patches both.
+    installGuardedProperty<(...args: never[]) => Promise<unknown>>(fs.promises, method, (getReal) =>
+        makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'reject'),
+    );
+}
+for (const method of FS_PROMISE_ONLY_WRITE_METHODS) {
+    installGuardedProperty<(...args: never[]) => Promise<unknown>>(fs.promises, method, (getReal) =>
+        makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'reject'),
+    );
+}
 
 // installGuardedProperty only patches each built-in's CJS default export; Node keeps ESM named
 // bindings (`import { spawn } from 'node:child_process'`) as separate references to the original
