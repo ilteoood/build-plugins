@@ -179,7 +179,7 @@ export function installGuardedProperty<T>(
         // A plain `function`, not an arrow, so `this` is the real receiver — needed to tell
         // `net.Socket.prototype.write = mock` (every socket) apart from `someSocket.write = mock`
         // (one socket) when `target` is a shared prototype.
-        set: function (this: unknown, value: T) {
+        set(this: unknown, value: T) {
             if (
                 this !== target &&
                 this !== null &&
@@ -775,11 +775,13 @@ const FS_PROMISE_ONLY_WRITE_METHODS = ['writeFile', 'appendFile', 'copyFile'] as
 for (const method of FS_SYNC_WRITE_METHODS) {
     installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsSyncWriteMethod);
 }
-for (const method of FS_CALLBACK_ONLY_WRITE_METHODS) {
+for (const method of [
+    ...FS_CALLBACK_ONLY_WRITE_METHODS,
+    ...FS_CALLBACK_AND_PROMISE_WRITE_METHODS,
+]) {
     installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsWriteCallbackMethod);
 }
 for (const method of FS_CALLBACK_AND_PROMISE_WRITE_METHODS) {
-    installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsWriteCallbackMethod);
     // fs.promises and require('fs/promises') are the same object — patching one patches both.
     installGuardedProperty<(...args: never[]) => Promise<unknown>>(
         fs.promises,

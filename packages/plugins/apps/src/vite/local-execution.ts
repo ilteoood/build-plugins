@@ -257,8 +257,10 @@ function assertNoSelfDeclaredScope(
 ): void {
     // assertConnectionIdAllowed only inspects this call's own top-level connectionId — a nested
     // meta-action carrying its own allowedConnectionIds inside inputs would otherwise reach the
-    // destination with a self-declared scope this function never validated.
-    if ('allowedConnectionIds' in inputs) {
+    // destination with a self-declared scope this function never validated. hasOwnProperty, not
+    // `in`, so a polluted Object.prototype can't make every subsequent call's inputs falsely
+    // appear to declare this key.
+    if (Object.prototype.hasOwnProperty.call(inputs, 'allowedConnectionIds')) {
         throw new Error(
             `Action ${actionDescription} must not declare its own allowedConnectionIds in inputs — this function's own allowlist already governs which connections it can use.`,
         );

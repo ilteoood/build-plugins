@@ -505,6 +505,33 @@ describe('local-execution — executeScriptLocally', () => {
         expect(executeAction).not.toHaveBeenCalled();
     });
 
+    // `in` matches inherited properties, not just inputs' own key — a polluted Object.prototype
+    // would otherwise make every subsequent call from every function in the process falsely appear
+    // to self-declare a scope, rejecting legitimate calls process-wide until restart.
+    test('Should not reject a legitimate call whose inputs have no own allowedConnectionIds, even when Object.prototype is polluted with that key', async () => {
+        // eslint-disable-next-line no-extend-native -- deliberately simulating a hostile/accidental prototype pollution to verify the own-property check below is immune to it
+        (Object.prototype as Record<string, unknown>).allowedConnectionIds = ['hostile'];
+        try {
+            const executeAction = jest.fn().mockResolvedValue({ ok: true });
+            await executeScriptLocally(
+                func,
+                TEST_PROJECT_ROOT,
+                [],
+                executeAction,
+                loadModuleReturning({
+                    example: () =>
+                        testDollar().Actions.datatransformation.jsFunctionWithActions({
+                            inputs: { script: 'legitimate' },
+                        }),
+                }),
+                mockLogger,
+            );
+            expect(executeAction).toHaveBeenCalled();
+        } finally {
+            delete (Object.prototype as Record<string, unknown>).allowedConnectionIds;
+        }
+    });
+
     // validateActionCall's own `typeof inputs !== 'object'` check passes an array through
     // unchanged (typeof [] === 'object'), but serializeActionInputs's shape check downstream
     // rejects it — inputs is semantically a plain object of named parameters, and a caller relying

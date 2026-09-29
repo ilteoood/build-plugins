@@ -1268,50 +1268,63 @@ describe('installGuardedProperty resilience', () => {
 });
 
 describe('installGuardedProperty security', () => {
-    // A dependency could otherwise call `Object.defineProperty(globalThis, 'fetch', {...})` directly
-    // to replace the whole descriptor, silently restoring real network access — closed by installing
-    // non-configurable outside of Jest. RUNNING_UNDER_JEST is computed once at module load, so a
-    // fresh module instance with JEST_WORKER_ID unset is required to exercise that production branch.
-    test('Should make a guarded property non-configurable outside of Jest, closing the Object.defineProperty bypass, while still allowing plain reassignment', () => {
-        const originalJestWorkerId = process.env.JEST_WORKER_ID;
-        delete process.env.JEST_WORKER_ID;
+    // A dependency could otherwise call `Object.defineProperty(target, 'value', {...})` directly to
+    // replace the whole descriptor, silently restoring the real function — closed by installing
+    // non-configurable. Unaffected by RUNNING_UNDER_JEST: shouldAllowConfigurableUnderJest only
+    // special-cases globalThis and net.Socket.prototype, so a plain object target is non-configurable
+    // regardless of environment — the globalThis-under-Jest carve-out has its own test below.
+    test('Should make a guarded property non-configurable, closing the Object.defineProperty bypass, while still allowing plain reassignment', () => {
+        const target: { value: unknown } = { value: () => 'real' };
+        installGuardedProperty(
+            target,
+            'value',
+            (getReal: () => () => unknown) =>
+                (...args: unknown[]) =>
+                    (getReal() as (...a: unknown[]) => unknown)(...args),
+        );
 
-        try {
-            // Definite assignment assertion: assigned synchronously inside jest.isolateModules below,
-            // which TS's control-flow analysis doesn't see into.
-            let freshInstallGuardedProperty!: typeof installGuardedProperty;
-            jest.isolateModules(() => {
-                // eslint-disable-next-line global-require -- must load fresh, with JEST_WORKER_ID unset, to exercise the non-Jest non-configurable branch
-                freshInstallGuardedProperty = require('./network-guard').installGuardedProperty;
+        // A dependency replacing the whole descriptor outright must now fail loudly...
+        expect(() => {
+            Object.defineProperty(target, 'value', {
+                configurable: true,
+                enumerable: true,
+                value: () => 'hostile replacement',
             });
+        }).toThrow(/Cannot redefine property/);
 
-            const target: { value: unknown } = { value: () => 'real' };
-            freshInstallGuardedProperty(
-                target,
-                'value',
-                (getReal: () => () => unknown) =>
-                    (...args: unknown[]) =>
-                        (getReal() as (...a: unknown[]) => unknown)(...args),
-            );
+        // ...while the legitimate "capture original, mock, restore" idiom still works via plain assignment.
+        const mock = () => 'mocked';
+        (target as { value: unknown }).value = mock;
+        expect((target.value as () => string)()).toBe('mocked');
+    });
 
-            // A dependency replacing the whole descriptor outright must now fail loudly...
-            expect(() => {
-                Object.defineProperty(target, 'value', {
-                    configurable: true,
-                    enumerable: true,
-                    value: () => 'hostile replacement',
-                });
-            }).toThrow(/Cannot redefine property/);
+    // The one target where installGuardedProperty deliberately becomes configurable is globalThis
+    // under Jest, to survive Jest's own globalThis Proxy. Outside Jest, globalThis must get the same
+    // non-configurable treatment as every other target — spawned as a real non-Jest process since
+    // jest.isolateModules can't hide the real jest/describe/expect globals Jest injects for the file.
+    test('Should make a guarded property on globalThis non-configurable in a real non-Jest process, closing the same bypass there', () => {
+        const result = child_process
+            .execFileSync(
+                process.execPath,
+                [
+                    '-r',
+                    'ts-node/register',
+                    '-e',
+                    "const ng = require(process.argv[1]); globalThis.__ngTestGlobalProp = () => 'real'; ng.installGuardedProperty(globalThis, '__ngTestGlobalProp', (getReal) => (...a) => getReal()(...a)); try { Object.defineProperty(globalThis, '__ngTestGlobalProp', { configurable: true, value: () => 'hostile' }); console.log('configurable'); } catch { console.log('non-configurable'); }",
+                    require.resolve('./network-guard'),
+                ],
+                {
+                    encoding: 'utf8',
+                    env: {
+                        ...process.env,
+                        TS_NODE_TRANSPILE_ONLY: '1',
+                        TS_NODE_COMPILER_OPTIONS: '{"module":"commonjs","moduleResolution":"node"}',
+                    },
+                },
+            )
+            .trim();
 
-            // ...while the legitimate "capture original, mock, restore" idiom still works via plain assignment.
-            const mock = () => 'mocked';
-            (target as { value: unknown }).value = mock;
-            expect((target.value as () => string)()).toBe('mocked');
-        } finally {
-            if (originalJestWorkerId !== undefined) {
-                process.env.JEST_WORKER_ID = originalJestWorkerId;
-            }
-        }
+        expect(result).toBe('non-configurable');
     });
 
     // The configurable-relax retry in installGuardedProperty's catch branch exists only for
