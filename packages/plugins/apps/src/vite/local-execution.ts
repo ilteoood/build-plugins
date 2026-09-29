@@ -19,8 +19,8 @@ import { createEpochGuard } from './execution-epoch';
 import type { BlockedScopeHandle } from './network-guard';
 import { getTotalRetryDelayBudgetMs } from './retry-delay';
 
-// Lazy, memoized — network-guard.ts installs process-wide monkeypatches (net.Socket, fetch, dgram,
-// dns, child_process, worker_threads.Worker) unconditionally at its own module-load time. A static
+// Lazy, memoized — network-guard.ts installs process-wide monkeypatches (fs write methods,
+// child_process, worker_threads.Worker) unconditionally at its own module-load time. A static
 // import here would trigger that install for every bundler that transitively imports this file via
 // index.ts (webpack/esbuild/rspack/rollup included), even though local execution is Vite-dev-only —
 // deferring the import until a local execution actually happens confines the install to Vite.
@@ -214,7 +214,7 @@ export function deriveActionTimeouts(longPolling: LongPollingConfig): {
 /** Loads a module by specifier, resolved against the customer's own project rather than build-plugins' dependency tree — the dev server passes its Vite instance's `ssrLoadModule` here. */
 export type LoadModule = (specifier: string) => Promise<Record<string, unknown>>;
 
-/** Loads a customer module under the same top-level-evaluation `$`-scoping `runScriptLocally` uses (see `customerModuleLoadContext`) — for callers like dev-server.ts's priming load that trigger real top-level evaluation ahead of `executeScriptLocally`. Accepted residual gap: this runs outside network-guard.ts's `runBlocked` scope (only the exported function's body is wrapped, not module-level evaluation), so a customer file's top-level code has real, unguarded network/subprocess access — not a hard security boundary, matching network-guard.ts's "no OS sandbox" framing. Awaits `getNetworkGuard()` first — the sole choke point every caller funnels through — so network-guard.ts's `trustedStdout`/`trustedStderr` capture (see that file) always happens before this unguarded window, not just before a later `runBlocked` call. */
+/** Loads a customer module under the same top-level-evaluation `$`-scoping `runScriptLocally` uses (see `customerModuleLoadContext`) — for callers like dev-server.ts's priming load that trigger real top-level evaluation ahead of `executeScriptLocally`. Accepted residual gap: this runs outside network-guard.ts's `runBlocked` scope (only the exported function's body is wrapped, not module-level evaluation), so a customer file's top-level code has real, unguarded subprocess/fs-write access — not a hard security boundary, matching network-guard.ts's "no OS sandbox" framing. Awaits `getNetworkGuard()` first — the sole choke point every caller funnels through — so network-guard.ts's `trustedFetch` capture (see that file) always happens before this unguarded window, not just before a later `runBlocked` call. */
 export async function loadCustomerModuleEntry(
     loadModule: LoadModule,
     entrySpecifier: string,
@@ -890,12 +890,12 @@ async function runScriptLocally(
                     rejectIfAbandoned();
                     const data = await runBlocked(
                         async () => {
-                            // Registered here, inside the same network-blocked scope as the
-                            // customer function itself, since their loadModule() calls resolve
-                            // real npm packages a customer project could declare, whose top-level
-                            // code would otherwise run with real, unguarded network/subprocess
-                            // access. Both adapters are stable and idempotent to re-register, so
-                            // no coordination is needed between them or across executions.
+                            // Registered here, inside the same blocked scope as the customer
+                            // function itself, since their loadModule() calls resolve real npm
+                            // packages a customer project could declare, whose top-level code
+                            // would otherwise run with real, unguarded subprocess/fs-write access.
+                            // Both adapters are stable and idempotent to re-register, so no
+                            // coordination is needed between them or across executions.
                             const actionCatalogRegistration = registerActionCatalogIfInstalled(
                                 loadModule,
                                 projectRoot,

