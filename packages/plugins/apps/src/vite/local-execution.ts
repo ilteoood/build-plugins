@@ -250,7 +250,7 @@ function assertConnectionIdAllowed(
     }
 }
 
-/** Rejects a self-declared scope on `inputs` — checked both before serialization (fails fast on the common case) and again after (a custom `toJSON()` runs during `JSON.stringify`, before any replacer sees the result, so it can introduce this key even when the original object never had it). */
+/** Rejects a self-declared scope on `inputs`. Checked before serialization to fail fast on the common case, and again after: a custom `toJSON()` runs during `JSON.stringify` before any replacer sees the result, so it can introduce this key even when the original object never had it. */
 function assertNoSelfDeclaredScope(
     inputs: Record<string, unknown>,
     actionDescription: string,
