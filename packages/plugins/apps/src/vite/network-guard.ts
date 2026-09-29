@@ -40,22 +40,41 @@ interface GuardedAsyncContext {
 // frozen too. The lookup is an own-property check, not a truthy check: a polluted
 // `Object.prototype` entry for this same symbol would otherwise be inherited and mistaken for an
 // already-installed instance, skipping real installation entirely.
-function getSharedContext(key: string): GuardedAsyncContext {
+function isGuardedAsyncContext(value: unknown): value is GuardedAsyncContext {
+    return (
+        typeof value === 'object' &&
+        value !== null &&
+        'isActive' in value &&
+        'run' in value &&
+        typeof value.isActive === 'function' &&
+        typeof value.run === 'function'
+    );
+}
+
+// Exported for testability — the own-property check below is only meaningfully exercised by
+// calling this directly against a polluted prototype, not by re-deriving its logic in a test.
+export function getSharedContext(key: string): GuardedAsyncContext {
     const symbol = Symbol.for(`@dd/apps-plugin/network-guard ${key}`);
-    const registry = net as unknown as Record<symbol, GuardedAsyncContext | undefined>;
-    if (!Object.prototype.hasOwnProperty.call(registry, symbol)) {
+    if (!Object.prototype.hasOwnProperty.call(net, symbol)) {
         const context = new AsyncLocalStorage<true>();
-        Object.defineProperty(registry, symbol, {
-            value: Object.freeze({
-                isActive: () => context.getStore() === true,
-                run: <T>(fn: () => T) => context.run(true, fn),
-            }),
+        const facade: GuardedAsyncContext = Object.freeze({
+            isActive: () => context.getStore() === true,
+            run: <T>(fn: () => T) => context.run(true, fn),
+        });
+        Object.defineProperty(net, symbol, {
+            value: facade,
             writable: false,
             configurable: false,
             enumerable: false,
         });
     }
-    return registry[symbol] as GuardedAsyncContext;
+    const stored: unknown = Reflect.get(net, symbol);
+    if (!isGuardedAsyncContext(stored)) {
+        throw new Error(
+            `Internal error: the "${key}" network-guard registry entry is not a valid guarded context.`,
+        );
+    }
+    return stored;
 }
 
 // Scoped to the active `runBlocked` call's async chain, not process-wide, so unrelated concurrent callers aren't blocked too.

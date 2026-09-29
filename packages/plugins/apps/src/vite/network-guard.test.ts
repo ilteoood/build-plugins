@@ -17,6 +17,7 @@ import {
     guardWebSocket,
     guardWorker,
     installGuardedProperty,
+    getSharedContext,
     runAllowed,
     runBlocked,
     trustedFetch,
@@ -1218,8 +1219,9 @@ describe('installGuardedProperty security', () => {
     });
 
     // A lookup that only checks truthiness (`!registry[symbol]`) would treat a value inherited
-    // from `net`'s own prototype chain as already-installed and skip real installation — the
-    // own-property check is what a dependency polluting that prototype has to defeat. Targets
+    // from `net`'s own prototype chain as already-installed and return it directly, skipping real
+    // installation — calling getSharedContext itself against a polluted prototype is what actually
+    // exercises that decision, not just re-deriving the inheritance semantics separately. Targets
     // `net`'s actual prototype rather than assuming it's literally `Object.prototype`, since a
     // sandboxed test runtime can give core modules a different (or null) one.
     test("Should not mistake a value inherited from net's own prototype chain for an already-installed registry entry", () => {
@@ -1230,10 +1232,14 @@ describe('installGuardedProperty security', () => {
         try {
             netPrototype[symbol] = pollutedFacade;
 
-            const registry = net as unknown as Record<symbol, unknown>;
-            expect(Object.prototype.hasOwnProperty.call(registry, symbol)).toBe(false);
-            expect(registry[symbol]).toBe(pollutedFacade);
+            const context = getSharedContext('pollutionProbe');
+
+            expect(context).not.toBe(pollutedFacade);
+            expect(Object.prototype.hasOwnProperty.call(net, symbol)).toBe(true);
+            expect(context.isActive()).toBe(false);
         } finally {
+            // Only the prototype pollution is ours to undo — the real own-property entry
+            // getSharedContext just installed is permanent by design, same as every other key.
             delete netPrototype[symbol];
         }
     });
