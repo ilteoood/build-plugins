@@ -1156,6 +1156,24 @@ describe('network-guard', () => {
                 expect(fs.readFileSync(testFile, 'utf8')).toBe('');
             });
 
+            test('Should block fs.ftruncate made inside fn via its error-first callback, not a synchronous throw', async () => {
+                fs.writeFileSync(testFile, 'data');
+                const fd = fs.openSync(testFile, 'r+');
+                try {
+                    await runBlocked(async () => {
+                        const err = await new Promise<Error>((resolve) => {
+                            expect(() =>
+                                fs.ftruncate(fd, 0, (truncateErr) => resolve(truncateErr as Error)),
+                            ).not.toThrow();
+                        });
+                        expect(err.message).toMatch(/Writing to the filesystem is not allowed/);
+                    });
+                } finally {
+                    fs.closeSync(fd);
+                }
+                expect(fs.readFileSync(testFile, 'utf8')).toBe('data');
+            });
+
             // mkdtemp creates a real directory, same class of write as mkdir — omitting it would let a
             // blocked function still create directories under the OS temp path.
             test('Should block fs.mkdtempSync made inside fn', async () => {

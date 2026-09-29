@@ -768,9 +768,9 @@ const FS_CALLBACK_AND_PROMISE_WRITE_METHODS = [
     'truncate',
     'mkdtemp',
 ] as const;
-// write has no fs.promises counterpart — only FileHandle.prototype.write (from fs.promises.open()),
-// covered by the residual-gap note above, not by this loop.
-const FS_CALLBACK_ONLY_WRITE_METHODS = ['write'] as const;
+// write/ftruncate have no fs.promises counterpart — only FileHandle.prototype.write/truncate (from
+// fs.promises.open()), covered by the residual-gap note above, not by this loop.
+const FS_CALLBACK_ONLY_WRITE_METHODS = ['write', 'ftruncate'] as const;
 const FS_PROMISE_ONLY_WRITE_METHODS = ['writeFile', 'appendFile', 'copyFile'] as const;
 for (const method of FS_SYNC_WRITE_METHODS) {
     installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsSyncWriteMethod);
