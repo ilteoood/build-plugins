@@ -11,10 +11,9 @@ export const ARCHIVE_FILENAME = 'datadog-app-assets.zip';
 export const BACKEND_FILE_RE = /\.backend\.(ts|tsx|js|jsx)$/;
 
 /**
- * A developer-maintained file that previously held real Custom Credentials values for local
- * execution. That resolution mechanism is gone, but the filename stays reserved and denied here —
- * removing local resolution doesn't retroactively make a leftover file in someone's project safe
- * to package, serve, or import.
+ * Reserved and denied from packaging, serving, or importing regardless of whether anything in this
+ * project actually reads it — a leftover file with this name in someone's project can hold real
+ * secret-shaped content, so its safety can't depend on which resolution mechanisms currently exist.
  */
 export const CUSTOM_CREDENTIALS_LOCAL_FILENAME = 'datadog-app.local.json';
 

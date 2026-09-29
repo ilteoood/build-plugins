@@ -67,8 +67,8 @@ describe('getBaseBackendBuildConfig', () => {
 
     // Regression coverage: Vite's loadEnv() copies any VITE_-prefixed key straight out of the real
     // process.env into import.meta.env, and its `define` plugin statically inlines that value into
-    // the built output at build time — completely bypassing runWithScopedEnv's runtime scoping,
-    // which only wraps module execution, never this bundling step.
+    // the built output at build time — a separate mechanism from whatever a backend function sees
+    // at runtime, so this guard (envFile: false, envPrefix: []) is needed regardless of that.
     test('Should not inline a VITE_-prefixed real process.env value into the built backend function', async () => {
         const seed = `build-config-env-leak-${Date.now()}`;
         const workingDir = getTempWorkingDir(seed);

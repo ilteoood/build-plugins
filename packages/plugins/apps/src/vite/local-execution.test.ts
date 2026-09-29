@@ -741,8 +741,8 @@ describe('local-execution — executeScriptLocally', () => {
                 mockLogger,
                 50,
             );
-            // Enqueued behind hungExecution — if the fix didn't bound the
-            // stalled $.Actions call, this would never get a turn either.
+            // Enqueued behind hungExecution — proves the stalled $.Actions call doesn't block the
+            // queue for later executions.
             const queuedNext = executeScriptLocally(
                 func,
                 TEST_PROJECT_ROOT,
@@ -809,10 +809,10 @@ describe('local-execution — executeScriptLocally', () => {
         }
     });
 
-    // Regression test: the absolute ceiling used to be a single fixed window from execution
-    // start, so two genuinely healthy sequential calls (each individually within bounds) could
-    // still sum past it. Re-arming the ceiling on each new call fixes that without weakening the
-    // hang protection above, which relies on the call never re-arming it at all.
+    // The absolute ceiling re-arms on each new $.Actions call — without that, two genuinely
+    // healthy sequential calls (each individually within bounds) could still sum past a single
+    // fixed window from execution start. This doesn't weaken the hang protection above, which
+    // relies on the call never re-arming it at all.
     test('Should not reject a function whose sequential $.Actions calls each individually stay within the absolute ceiling but sum past it', async () => {
         jest.useFakeTimers();
         try {

@@ -174,7 +174,7 @@ export const getVitePlugin = ({
                     CUSTOM_CREDENTIALS_LOCAL_FILENAME
                 ) {
                     throw new Error(
-                        `${CUSTOM_CREDENTIALS_LOCAL_FILENAME} cannot be imported directly — read Custom Credentials via process.env instead.`,
+                        `${CUSTOM_CREDENTIALS_LOCAL_FILENAME} cannot be imported directly — set the values as real environment variables in your own shell/dev-server session instead.`,
                     );
                 }
 
