@@ -172,7 +172,7 @@ export function installGuardedProperty<T>(
     let currentGuard = buildGuard();
     const getter = (): T => currentGuard;
     (getter as unknown as { [ALREADY_GUARDED]: true })[ALREADY_GUARDED] = true;
-    Object.defineProperty(target, prop, {
+    const descriptor: PropertyDescriptor = {
         configurable: shouldAllowConfigurableUnderJest(target, prop),
         enumerable: true,
         get: getter,
@@ -202,7 +202,16 @@ export function installGuardedProperty<T>(
                 : value;
             currentGuard = buildGuard();
         },
-    });
+    };
+    try {
+        Object.defineProperty(target, prop, descriptor);
+    } catch {
+        // Falls through to here specifically when Jest's globalThis Proxy rejects a
+        // non-configurable property — RUNNING_UNDER_JEST's shape check only recognizes Jest's
+        // default global injection, so this catch is what actually catches the crash under
+        // injectGlobals: false or a runner with an equivalent Proxy, regardless of global shape.
+        Object.defineProperty(target, prop, { ...descriptor, configurable: true });
+    }
 }
 
 // write/end signal failure by erroring/destroying the stream, not throwing — a synchronous throw
@@ -355,10 +364,18 @@ function makeCallbackGuard(blockedMessage: string) {
                 return (getReal() as unknown as (...a: unknown[]) => unknown).apply(this, args);
             }
             const err = new Error(blockedMessage);
-            if (!invokeCallbackArg(args, err) && this instanceof EventEmitter) {
-                emitAsyncErrorIfListened(this, err);
+            if (invokeCallbackArg(args, err)) {
+                return undefined;
             }
-            return undefined;
+            if (this instanceof EventEmitter) {
+                emitAsyncErrorIfListened(this, err);
+                return undefined;
+            }
+            // No callback found and no EventEmitter to fall back on (fs's callback methods pass
+            // the fs module itself as `this`) — real fs throws synchronously for a missing
+            // callback regardless of block state, so silently returning here would mask that
+            // caller bug instead of surfacing it.
+            throw new TypeError('Callback must be a function');
         };
         return wrapper as unknown as F;
     };
@@ -701,20 +718,22 @@ installGuardedProperty<(...args: never[]) => unknown>(
 
 installGuardedProperty<unknown>(worker_threads, 'Worker', guardWorker);
 
-// Reads stay open — Vite's own SSR loading and a dependency reading a bundled data file both need
-// them, and this guard's job is dev-loop safety, not a hard security boundary (see the "No OS
-// sandbox" note above). Only the write side is guarded, matching production's Deno sandbox denying
-// fs outright. chown/chmod (+ Sync) are excluded entirely, and writeFile/appendFile/copyFile's
-// callback form is guarded only via its Sync/promise siblings below, not here — graceful-fs (a
-// common transitive dependency, e.g. via webpack/rspack's own tooling) unconditionally reassigns
-// exactly these methods at its own module-load time for portability shims, colliding with this
-// guard's non-configurable property hard enough to throw and crash the process outright,
-// regardless of whether that load happens under Jest. open/openSync's own writable fd, and a
-// FileHandle's own write()/writeFile() methods from fs.promises.open() (need a handle-construction
-// guard, not a call guard), plus createWriteStream/writev(Sync), are a further documented residual
-// gap, same framing as dns.lookup's exclusion above — write/writeSync below close the far more
-// direct openSync-then-write bypass of that same gap.
+// Reads stay open, matching this guard's general dev-loop-safety framing rather than a hard
+// security boundary. Only the write side is guarded, matching production's Deno sandbox denying fs
+// outright. chown/chmod and their Sync forms are excluded entirely. writeFile/appendFile/copyFile's
+// callback form is guarded only via its Sync/promise siblings below, not directly: graceful-fs, a
+// common transitive dependency pulled in by tools like webpack/rspack, unconditionally reassigns
+// exactly these methods at its own module-load time, and colliding with this guard's
+// non-configurable property throws hard enough to crash the process outright regardless of Jest.
+// open/openSync's own writable fd, and a FileHandle's write()/writeFile() methods from
+// fs.promises.open(), need a handle-construction guard rather than a call guard and are a further
+// documented residual gap; createWriteStream/writev(Sync) share that gap too. write/writeSync below
+// close the more direct openSync-then-write bypass of the same gap.
 const guardFsWriteCallbackMethod = makeCallbackGuard(FS_WRITE_BLOCKED_MESSAGE);
+const guardFsSyncWriteMethod = (getReal: () => (...args: never[]) => unknown) =>
+    makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'throw');
+const guardFsPromiseWriteMethod = (getReal: () => (...args: never[]) => Promise<unknown>) =>
+    makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'reject');
 const FS_SYNC_WRITE_METHODS = [
     'writeFileSync',
     'appendFileSync',
@@ -742,24 +761,31 @@ const FS_CALLBACK_AND_PROMISE_WRITE_METHODS = [
     'cp',
     'truncate',
     'mkdtemp',
-    'write',
 ] as const;
+// write has no fs.promises counterpart — only FileHandle.prototype.write (from fs.promises.open()),
+// covered by the residual-gap note above, not by this loop.
+const FS_CALLBACK_ONLY_WRITE_METHODS = ['write'] as const;
 const FS_PROMISE_ONLY_WRITE_METHODS = ['writeFile', 'appendFile', 'copyFile'] as const;
 for (const method of FS_SYNC_WRITE_METHODS) {
-    installGuardedProperty<(...args: never[]) => unknown>(fs, method, (getReal) =>
-        makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'throw'),
-    );
+    installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsSyncWriteMethod);
+}
+for (const method of FS_CALLBACK_ONLY_WRITE_METHODS) {
+    installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsWriteCallbackMethod);
 }
 for (const method of FS_CALLBACK_AND_PROMISE_WRITE_METHODS) {
     installGuardedProperty<(...args: never[]) => unknown>(fs, method, guardFsWriteCallbackMethod);
     // fs.promises and require('fs/promises') are the same object — patching one patches both.
-    installGuardedProperty<(...args: never[]) => Promise<unknown>>(fs.promises, method, (getReal) =>
-        makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'reject'),
+    installGuardedProperty<(...args: never[]) => Promise<unknown>>(
+        fs.promises,
+        method,
+        guardFsPromiseWriteMethod,
     );
 }
 for (const method of FS_PROMISE_ONLY_WRITE_METHODS) {
-    installGuardedProperty<(...args: never[]) => Promise<unknown>>(fs.promises, method, (getReal) =>
-        makeGuardWrapper(getReal, FS_WRITE_BLOCKED_MESSAGE, 'reject'),
+    installGuardedProperty<(...args: never[]) => Promise<unknown>>(
+        fs.promises,
+        method,
+        guardFsPromiseWriteMethod,
     );
 }
 

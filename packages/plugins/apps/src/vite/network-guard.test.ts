@@ -1072,6 +1072,18 @@ describe('network-guard', () => {
                 expect(fs.existsSync(testFile)).toBe(true);
             });
 
+            // Real fs.unlink throws synchronously for a missing callback regardless of block
+            // state, since `this` is the fs module object rather than an EventEmitter — a caller
+            // bug that must surface as a thrown error, not be silently swallowed.
+            test('Should throw synchronously from fs.unlink made inside fn with no callback argument', async () => {
+                const unlinkWithoutCallback = fs.unlink as unknown as (path: string) => void;
+                await expect(
+                    runBlocked(async () => {
+                        unlinkWithoutCallback(testFile);
+                    }),
+                ).rejects.toThrow(/Callback must be a function/);
+            });
+
             test('Should reject rather than throw synchronously from fs.promises.writeFile when blocked', async () => {
                 await runBlocked(async () => {
                     await expect(fs.promises.writeFile(testFile, 'data')).rejects.toThrow(
