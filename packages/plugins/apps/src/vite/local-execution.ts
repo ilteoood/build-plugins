@@ -855,19 +855,6 @@ async function runScriptLocally(
             // Scopes globalThis.$ and the dispatch info to this call's own async continuation chain.
             return await backendGlobalsContext.run({ value: $ }, () =>
                 executionDispatchContext.run(dispatch, async () => {
-                    // Both adapters are stable and idempotent to re-register, so no coordination is needed between them or across executions.
-                    const actionCatalogRegistration = registerActionCatalogIfInstalled(
-                        loadModule,
-                        projectRoot,
-                        timeoutMs,
-                    );
-                    const backendRuntimeRegistration = registerBackendRuntimeIfInstalled(
-                        loadModule,
-                        projectRoot,
-                        timeoutMs,
-                    );
-                    await Promise.all([actionCatalogRegistration, backendRuntimeRegistration]);
-
                     const rejectIfAbandoned = () => {
                         if (!scope.isCurrent()) {
                             throw new Error(
@@ -884,6 +871,30 @@ async function runScriptLocally(
                     rejectIfAbandoned();
                     const data = await runBlocked(
                         async () => {
+                            // Registered here, inside the same network-blocked scope as the
+                            // customer function itself, since their loadModule() calls resolve
+                            // real npm packages a customer project could declare, whose top-level
+                            // code would otherwise run with real, unguarded network/subprocess
+                            // access. Both adapters are stable and idempotent to re-register, so
+                            // no coordination is needed between them or across executions.
+                            const actionCatalogRegistration = registerActionCatalogIfInstalled(
+                                loadModule,
+                                projectRoot,
+                                timeoutMs,
+                            );
+                            const backendRuntimeRegistration = registerBackendRuntimeIfInstalled(
+                                loadModule,
+                                projectRoot,
+                                timeoutMs,
+                            );
+                            await Promise.all([
+                                actionCatalogRegistration,
+                                backendRuntimeRegistration,
+                            ]);
+                            // Registration's loadModule() calls can themselves take long enough to
+                            // cross the timeout — the customer function must never run once
+                            // already abandoned.
+                            rejectIfAbandoned();
                             const result = await fn(...args);
                             return assertJsonSerializable(result, func);
                         },
