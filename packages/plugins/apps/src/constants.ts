@@ -10,6 +10,14 @@ export const PLUGIN_NAME: PluginName = 'datadog-apps-plugin' as const;
 export const ARCHIVE_FILENAME = 'datadog-app-assets.zip';
 export const BACKEND_FILE_RE = /\.backend\.(ts|tsx|js|jsx)$/;
 
+/**
+ * A developer-maintained file that previously held real Custom Credentials values for local
+ * execution. That resolution mechanism is gone, but the filename stays reserved and denied here —
+ * removing local resolution doesn't retroactively make a leftover file in someone's project safe
+ * to package, serve, or import.
+ */
+export const CUSTOM_CREDENTIALS_LOCAL_FILENAME = 'datadog-app.local.json';
+
 /** Query suffix marking a local-execution load, so the transform hook can target it directly instead of matching on the broader `options.ssr` flag. */
 export const LOCAL_EXECUTION_LOAD_SUFFIX = '?dd-local-exec';
 // Matches a backend file with any (or no) trailing query string — scoping only to the exact local-execution suffix would let an unrecognized query slip past this filter and leak the real backend source instead of the safe proxy stub; the handler decides safety per case.
