@@ -34,9 +34,9 @@ export class MissingAuthenticationError extends Error {
     }
 }
 
-// Build the dev-server request authenticator. API-key auth (DD_API_KEY +
-// DD_APP_KEY) takes precedence; otherwise the OAuth access token that
-// @datadog/apps-cli passes via DD_OAUTH_ACCESS_TOKEN is used.
+// Accepted risk: DD_API_KEY/DD_APP_KEY/DD_OAUTH_ACCESS_TOKEN stay live in the real process.env for
+// the whole dev-server session by design (no process separation here, matching every other local
+// dev tool), so a compromised backend-function dependency can read them like any other env var.
 export const getAuthenticatedRequest = (): DoAuthenticatedRequest => {
     const apiKey = getDDEnvValue('API_KEY');
     const appKey = getDDEnvValue('APP_KEY');
