@@ -1182,6 +1182,61 @@ describe('installGuardedProperty security', () => {
             });
         }).toThrow(/Cannot redefine property/);
     });
+
+    // A raw AsyncLocalStorage instance on the registry would let any code with `require('net')`
+    // call `.disable()` on it and permanently kill network blocking process-wide — a stronger
+    // bypass than reading a value, since it disarms every future runBlocked call too.
+    test('Should not let a `.disable()` call reached via the fs-keyed registry entry disarm network blocking for a later runBlocked call', async () => {
+        const symbol = Symbol.for('@dd/apps-plugin/network-guard blockedContext');
+        const registry = net as unknown as Record<symbol, Record<string, unknown>>;
+        const entry = registry[symbol];
+
+        expect(typeof entry.isActive).toBe('function');
+        expect(typeof entry.run).toBe('function');
+        expect(entry.disable).toBeUndefined();
+        expect(entry.getStore).toBeUndefined();
+
+        await expect(
+            runBlocked(async () => {
+                new net.Socket().connect(80, 'example.com');
+            }),
+        ).rejects.toThrow(/Network access is not allowed/);
+    });
+
+    // The facade object itself is a plain object; non-writable/non-configurable on the registry
+    // property only stops the property from being replaced, not the object's own methods from
+    // being reassigned by any code holding a `net` reference.
+    test('Should freeze the shared facade so its isActive/run methods cannot be reassigned', () => {
+        const symbol = Symbol.for('@dd/apps-plugin/network-guard blockedContext');
+        const registry = net as unknown as Record<symbol, Record<string, unknown>>;
+        const entry = registry[symbol];
+
+        expect(Object.isFrozen(entry)).toBe(true);
+        expect(() => {
+            entry.isActive = () => false;
+        }).toThrow();
+    });
+
+    // A lookup that only checks truthiness (`!registry[symbol]`) would treat a value inherited
+    // from `net`'s own prototype chain as already-installed and skip real installation — the
+    // own-property check is what a dependency polluting that prototype has to defeat. Targets
+    // `net`'s actual prototype rather than assuming it's literally `Object.prototype`, since a
+    // sandboxed test runtime can give core modules a different (or null) one.
+    test("Should not mistake a value inherited from net's own prototype chain for an already-installed registry entry", () => {
+        const symbol = Symbol.for('@dd/apps-plugin/network-guard pollutionProbe');
+        const pollutedFacade = { isActive: () => false, run: (fn: () => unknown) => fn() };
+        const netPrototype = Object.getPrototypeOf(net) as Record<symbol, unknown>;
+
+        try {
+            netPrototype[symbol] = pollutedFacade;
+
+            const registry = net as unknown as Record<symbol, unknown>;
+            expect(Object.prototype.hasOwnProperty.call(registry, symbol)).toBe(false);
+            expect(registry[symbol]).toBe(pollutedFacade);
+        } finally {
+            delete netPrototype[symbol];
+        }
+    });
 });
 
 describe('guardEventSource and guardWorker', () => {

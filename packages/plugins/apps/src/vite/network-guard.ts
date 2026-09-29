@@ -25,24 +25,37 @@ const SUBPROCESS_BLOCKED_MESSAGE = 'Spawning a subprocess is not allowed in back
 const WORKER_THREAD_BLOCKED_MESSAGE =
     'Spawning a worker thread is not allowed in backend functions.';
 
+interface GuardedAsyncContext {
+    isActive(): boolean;
+    run<T>(fn: () => T): T;
+}
+
 // Keyed on the real `net` module (not a per-module `new AsyncLocalStorage()`) since this file gets
 // evaluated more than once — bundled copies and Jest's per-test-file isolation — and every
 // evaluation needs the same store. `globalThis`/`process` are sandboxed per test file too; core
-// modules aren't.
-function getSharedContext(key: string): AsyncLocalStorage<true> {
+// modules aren't. Returns isActive()/run() rather than the raw instance, since any code with
+// `require('net')` can read whatever this stores, and a raw instance's own `.disable()` would kill
+// this guard's scope detection process-wide — non-writable/non-configurable alone only stops the
+// property from being replaced, not the stored object from being mutated, so the facade itself is
+// frozen too. The lookup is an own-property check, not a truthy check: a polluted
+// `Object.prototype` entry for this same symbol would otherwise be inherited and mistaken for an
+// already-installed instance, skipping real installation entirely.
+function getSharedContext(key: string): GuardedAsyncContext {
     const symbol = Symbol.for(`@dd/apps-plugin/network-guard ${key}`);
-    const registry = net as unknown as Record<symbol, AsyncLocalStorage<true> | undefined>;
-    if (!registry[symbol]) {
-        // Non-configurable/non-writable so no code holding a `net` reference can swap in a fake
-        // store and disable every guard at once (isCurrentlyBlocked() is their shared gate).
+    const registry = net as unknown as Record<symbol, GuardedAsyncContext | undefined>;
+    if (!Object.prototype.hasOwnProperty.call(registry, symbol)) {
+        const context = new AsyncLocalStorage<true>();
         Object.defineProperty(registry, symbol, {
-            value: new AsyncLocalStorage<true>(),
+            value: Object.freeze({
+                isActive: () => context.getStore() === true,
+                run: <T>(fn: () => T) => context.run(true, fn),
+            }),
             writable: false,
             configurable: false,
             enumerable: false,
         });
     }
-    return registry[symbol] as AsyncLocalStorage<true>;
+    return registry[symbol] as GuardedAsyncContext;
 }
 
 // Scoped to the active `runBlocked` call's async chain, not process-wide, so unrelated concurrent callers aren't blocked too.
@@ -52,7 +65,7 @@ const blockedContext = getSharedContext('blockedContext');
 const allowedContext = getSharedContext('allowedContext');
 
 function isCurrentlyBlocked(): boolean {
-    return blockedContext.getStore() === true && allowedContext.getStore() !== true;
+    return blockedContext.isActive() && !allowedContext.isActive();
 }
 
 // `Symbol.for`, not `Symbol()`, so every re-evaluation of this file recognizes an already-installed guard instead of minting its own.
@@ -675,7 +688,7 @@ export async function runBlocked<T>(
     const scope = blockEpoch.start();
     onScopeStarted?.({ abandonIfCurrent: () => scope.concludeIfCurrent() });
     try {
-        return await blockedContext.run(true, fn);
+        return await blockedContext.run(fn);
     } finally {
         scope.concludeIfCurrent();
     }
@@ -686,7 +699,7 @@ export async function runAllowed<T>(fn: () => Promise<T>): Promise<T> {
     if (!blockEpoch.hasActiveScope()) {
         return fn();
     }
-    return allowedContext.run(true, fn);
+    return allowedContext.run(fn);
 }
 
 // Test-only escape hatch for resetting shared module state between tests — unconditional, unlike
