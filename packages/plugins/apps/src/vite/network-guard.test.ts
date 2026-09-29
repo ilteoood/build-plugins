@@ -1122,6 +1122,23 @@ describe('network-guard', () => {
                 expect(fs.readFileSync(testFile, 'utf8')).toBe('');
             });
 
+            // Same openSync-then-fd-op bypass as writeSync above, but destroying existing content
+            // instead of appending new content.
+            test('Should block fs.ftruncateSync made inside fn on an fd from openSync', async () => {
+                fs.writeFileSync(testFile, 'data');
+                const fd = fs.openSync(testFile, 'r+');
+                try {
+                    await expect(
+                        runBlocked(async () => {
+                            fs.ftruncateSync(fd, 0);
+                        }),
+                    ).rejects.toThrow(/Writing to the filesystem is not allowed/);
+                } finally {
+                    fs.closeSync(fd);
+                }
+                expect(fs.readFileSync(testFile, 'utf8')).toBe('data');
+            });
+
             test('Should block fs.write made inside fn via its error-first callback, not a synchronous throw', async () => {
                 const fd = fs.openSync(testFile, 'w');
                 try {
@@ -1277,6 +1294,28 @@ describe('installGuardedProperty security', () => {
                 process.env.JEST_WORKER_ID = originalJestWorkerId;
             }
         }
+    });
+
+    // The configurable-relax retry in installGuardedProperty's catch branch exists only for
+    // globalThis (Jest's globalThis Proxy). Every other target must keep failing loudly on a
+    // defineProperty collision instead of silently downgrading to configurable: true.
+    test('Should rethrow rather than silently relax configurability when defineProperty fails on a non-globalThis target', () => {
+        const target: { value: unknown } = { value: () => 'real' };
+        Object.defineProperty(target, 'value', {
+            value: () => 'real',
+            configurable: false,
+            writable: false,
+        });
+
+        expect(() =>
+            installGuardedProperty(
+                target,
+                'value',
+                (getReal: () => () => unknown) =>
+                    (...args: unknown[]) =>
+                        (getReal() as (...a: unknown[]) => unknown)(...args),
+            ),
+        ).toThrow(/Cannot redefine property/);
     });
 
     // A hostile dependency could set globalThis.jest = {} to fake RUNNING_UNDER_JEST outside real

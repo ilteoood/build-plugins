@@ -205,11 +205,16 @@ export function installGuardedProperty<T>(
     };
     try {
         Object.defineProperty(target, prop, descriptor);
-    } catch {
-        // Falls through to here specifically when Jest's globalThis Proxy rejects a
-        // non-configurable property — RUNNING_UNDER_JEST's shape check only recognizes Jest's
-        // default global injection, so this catch is what actually catches the crash under
-        // injectGlobals: false or a runner with an equivalent Proxy, regardless of global shape.
+    } catch (err) {
+        // Scoped to globalThis only: Jest's globalThis Proxy rejects a non-configurable property
+        // even when RUNNING_UNDER_JEST's shape check misses it (e.g. injectGlobals: false). Every
+        // other guarded target (net.Socket.prototype, fs, child_process, ...) must keep failing
+        // loudly on a defineProperty collision — silently relaxing configurability there would let
+        // a later Object.defineProperty call fully replace the guard instead of just being shadowed
+        // by the setter above.
+        if (target !== globalThis) {
+            throw err;
+        }
         Object.defineProperty(target, prop, { ...descriptor, configurable: true });
     }
 }
@@ -747,6 +752,7 @@ const FS_SYNC_WRITE_METHODS = [
     'linkSync',
     'cpSync',
     'truncateSync',
+    'ftruncateSync',
     'mkdtempSync',
     'writeSync',
 ] as const;
